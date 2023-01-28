@@ -7,7 +7,7 @@ const backupSshKeys = ``;
 // Worker 的访问地址, 如果不填的话默认为请求的地址, 填了就会用这里的地址(要去 Worker 的触发器那绑定, 否则无效).
 const defaultBaseUrl = "";
 // Cron 表达式, 默认 1 天执行一次更新.
-const cronExpression = "0 0 0 * * ?";
+const cronExpression = "0 0 * * *";
 
 // 下面的东西一般不用改.
 const baseRepoPageUrl = `https://${githubUserName.toLowerCase()}.github.io/${githubInstSshProjectName}/`;

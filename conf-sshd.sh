@@ -212,6 +212,6 @@ if [ $(has_param "-c" "--cron") == "true" ]; then
         chmod +x ~/.conf-sshd/conf-sshd.sh
         echo "Install conf-sshd script successfully."
         # 将当前脚本添加到 Crontab 中
-        echo "$cron /bin/bash ~/.conf-sshd/conf-sshd.sh -o -k $sshkey_url" | crontab -
+        echo "$cron /bin/bash ~/.conf-sshd/conf-sshd.sh -o -k $sshkey_url >> ~/.conf-sshd/run.log" | crontab -
     fi
 fi
