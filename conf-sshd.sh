@@ -84,7 +84,10 @@ update_sshkeys() {
         echo "Failed to download SSH public key at $(date '+%Y-%m-%d %H:%M:%S')"
         exit 1
     fi
-    curl -s $sshkey_url > ~/.ssh/authorized_keys || (echo "Failed to download SSH public key." && exit 1)
+    echo "-------------------- SSH Keys --------------------"
+    echo "$ssh_keys"
+    echo "--------------------------------------------------"
+    echo $ssh_keys > ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
     # 输出更新成功，需要附带时间日期
     echo "SSH public key updated successfully at $(date '+%Y-%m-%d %H:%M:%S')"
