@@ -163,7 +163,7 @@ update_sshkeys
 # 检查是否指定了 --cron
 if [ $(has_param "-c" "--cron") == "true" ]; then
     # 检查 Crontab 是否已安装
-    if [ $(command -v crontab) == "" ]; then
+    if [ "$(command -v crontab)" == "" ]; then
         if [ $(id -u) -eq 0 ]; then
             echo "The crontab is not installed, and the script is executed as a root user, so it will be installed."
             if [ -f /etc/redhat-release ]; then
