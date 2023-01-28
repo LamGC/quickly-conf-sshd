@@ -1,14 +1,20 @@
+#!/bin/bash
+
+########## 一些配置 ##########
+
 # 默认获取 SSH key 的地方，一般是 Github.
-sshkey_url="https://github.com/LamGC.keys"
+sshkey_url="https://quickly-conf-ssh-worker.lamgc.workers.dev/ssh.keys"
 # 默认的 Cron 执行计划, 每天凌晨 0 点执行
 default_cron="0 0 * * *"
 # 脚本 Url
 script_url="{{ script_url }}"
 
+########### 脚本区 ###########
+
 script_params=$@
 has_param() {
     for param in $script_params; do
-        for tParam in $script_params; do
+        for tParam in $@; do
             if [ "$tParam" == "$param" ]; then
                 echo "true"
                 return
@@ -19,7 +25,7 @@ has_param() {
 }
 
 get_param_value() {
-    $find=false
+    local find=false
     for param in $script_params; do
         if [ "$find" == "true" ]; then
             echo $param
@@ -36,12 +42,13 @@ get_param_value() {
 
 # 检查并更新 SSH key 地址.
 if [ $(has_param "-k" "--sshkey-url") == "true" ]; then
-    new_sshkey_url=$(get_param_value "-k" "--sshkey-url")
+    local new_sshkey_url=$(get_param_value "-k" "--sshkey-url")
     if [ "$new_sshkey_url" == "" ]; then
         echo "Please specify the URL of the SSH public key."
         exit 1
     fi
     sshkey_url=$new_sshkey_url
+    echo "A new SSH keys URL has been specified: $sshkey_url"
 fi
 
 # 帮助信息.
@@ -72,7 +79,7 @@ update_sshkeys() {
     fi
     echo "Downloading SSH public key from `$sshkey_url`"
     mkdir -p ~/.ssh
-    ssh_keys=$(curl -s $sshkey_url)
+    local ssh_keys=$(curl -s $sshkey_url)
     if [ $? -ne 0 ] || [ "$ssh_keys" == "" ]; then
         echo "Failed to download SSH public key at $(date '+%Y-%m-%d %H:%M:%S')"
         exit 1
@@ -91,6 +98,7 @@ fi
 
 # 检查是否指定了 --update-self
 if [ $(has_param "-u" "--update-self") == "true" ]; then
+    echo "Updating conf-sshd script..."
     cp $0 ~/.conf-sshd/conf-sshd.sh.bak
     curl -s $script_url > $0 || cp ~/.conf-sshd/conf-sshd.sh.bak $0 && echo "Script update failed at $(date '+%Y-%m-%d %H:%M:%S')" && exit 1
     chmod +x ~/.conf-sshd/conf-sshd.sh
