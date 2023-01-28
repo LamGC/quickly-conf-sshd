@@ -11,7 +11,7 @@ script_url="{{ script_url }}"
 
 ############ 脚本区 ##########
 
-script_params=$@
+script_params=$*
 has_param() {
     for param in $script_params; do
         for tParam in $@; do
