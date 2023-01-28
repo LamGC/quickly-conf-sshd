@@ -3,7 +3,7 @@
 ########## 一些配置 ##########
 
 # 默认获取 SSH key 的地方，一般是 Github.
-sshkey_url="https://quickly-conf-ssh-worker.lamgc.workers.dev/ssh.keys"
+sshkey_url="https://q-ssh.lamgc.me/ssh.keys"
 # 默认的 Cron 执行计划, 每天凌晨 0 点执行
 default_cron="0 0 * * *"
 # 脚本 Url
