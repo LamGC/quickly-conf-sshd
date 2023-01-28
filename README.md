@@ -1,14 +1,27 @@
 # Quickly Configuring SSH Server
-Quickly install SSH into the server.
+快速地将 SSH 密钥部署到服务器中，并定期更新。
+
+这个脚本可以帮你做到这些事情：
+- 快速配置服务器的 SSH Server；
+- 定期自动更新 SSH 公钥到服务器中；
+- 集中管理注册到服务器的 SSH 公钥（例如使用 Github 管理 SSH 公钥）；
 
 ## Usage
-执行命令：
+部署密钥并设置定期更新：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s -- -c
 ```
-如果不希望自动更新密钥，可以执行：
+如果不希望自动更新密钥，可以移除 `-c` 参数：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s
+```
+添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH：
+```bash
+curl -s https://ssh.lamgc.me | bash -s -- -p yes
+```
+要查看脚本的帮助信息，请使用 `-h` 参数：
+```bash
+curl -s https://ssh.lamgc.me | bash -s -- -h
 ```
 
 ## Install
