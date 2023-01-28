@@ -7,7 +7,7 @@ sshkey_url="https://q-ssh.lamgc.me/ssh.keys"
 # 默认的 Cron 执行计划, 每天凌晨 0 点执行
 default_cron="0 0 * * *"
 # 脚本 Url
-script_url="https://q-ssh.lamgc.me"
+script_url="https://q-ssh.lamgc.me/script.sh"
 
 ############ 脚本区 ##########
 
