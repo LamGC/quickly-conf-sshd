@@ -43,8 +43,7 @@ get_param_value() {
     done
 }
 
-# 检查并更新 SSH key 地址.
-if [ $(has_param "-k" "--sshkey-url") == "true" ]; then
+use_param_keys_url() {
     local new_sshkey_url=$(get_param_value "-k" "--sshkey-url")
     if [ "$new_sshkey_url" == "" ]; then
         echo "Please specify the URL of the SSH public key."
@@ -52,6 +51,11 @@ if [ $(has_param "-k" "--sshkey-url") == "true" ]; then
     fi
     sshkey_url=$new_sshkey_url
     echo "A new SSH keys URL has been specified: $sshkey_url"
+}
+
+# 检查并更新 SSH key 地址.
+if [ $(has_param "-k" "--sshkey-url") == "true" ]; then
+    use_param_keys_url
 fi
 
 # 帮助信息.
