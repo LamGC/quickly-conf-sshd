@@ -141,10 +141,12 @@ if [ $(has_param "-p" "--allow-root-passwd") == "true" ]; then
         allow_root_passwd=$(get_param_value "-p" "--allow-root-passwd" | tr '[:upper:]' '[:lower:]')
         if [ "$allow_root_passwd" == "yes" ]; then
             # 设置允许 root 使用密码登录
-            sed -i 's/PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+            sed -i 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+            echo "Root user is allowed to log in with password."
         elif [ "$allow_root_passwd" == "no" ]; then
             # 设置禁止 root 使用密码登录
-            sed -i 's/PermitRootLogin.*/PermitRootLogin no/g' /etc/ssh/sshd_config
+            sed -i 's/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/g' /etc/ssh/sshd_config
+            echo "Root user is prohibited from logging in with password."
         else
             echo "Please specify whether to allow root to log in with a password."
             exit 1
