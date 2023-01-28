@@ -77,7 +77,7 @@ update_sshkeys() {
         echo "Please specify the URL of the SSH public key."
         exit 1
     fi
-    echo "Downloading SSH public key from `$sshkey_url`"
+    echo "Downloading SSH public key from '$sshkey_url'"
     mkdir -p ~/.ssh
     local ssh_keys=$(curl -s $sshkey_url)
     if [ $? -ne 0 ] || [ "$ssh_keys" == "" ]; then
