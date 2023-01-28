@@ -9,7 +9,7 @@ default_cron="0 0 * * *"
 # 脚本 Url
 script_url="{{ script_url }}"
 
-########### 脚本区 ###########
+############ 脚本区 ##########
 
 script_params=$@
 has_param() {
@@ -28,15 +28,18 @@ get_param_value() {
     local find=false
     for param in $script_params; do
         if [ "$find" == "true" ]; then
-            echo $param
-            return
-        fi
-        if [ "$param" == "$1" ]; then
             if [[ $param == -* ]]; then
                 return
             fi
-            find=true
+            echo $param
+            return
         fi
+        for tParam in $@; do
+            if [ "$tParam" == "$param" ]; then
+                find=true
+                break
+            fi
+        done
     done
 }
 
@@ -69,6 +72,7 @@ if [ $(has_param "-h" "--help") == "true" ]; then
     echo "only available when the script is executed as root:"
     echo "  -n, --no-install-sshd                   Do not install SSH Server."
     echo "  -p, --allow-root-passwd <yes | no>      Allow Root to log in with a password."
+    echo ""
     exit 0
 fi
 
