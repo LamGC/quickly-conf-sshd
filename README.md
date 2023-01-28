@@ -15,13 +15,34 @@ curl -s https://ssh.lamgc.me | bash -s -- -c
 ```bash
 curl -s https://ssh.lamgc.me | bash -s
 ```
-添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH：
+添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH（需使用 Root 用户执行脚本）：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s -- -p yes
 ```
 要查看脚本的帮助信息，请使用 `-h` 参数：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s -- -h
+```
+
+## Paths
+获取 SSH 公钥：
+```
+https://ssh.lamgc.me/ssh.keys
+```
+
+获取 Shell 脚本：
+```
+https://ssh.lamgc.me/script.sh
+```
+
+获取 Shell 脚本（使用 Curl 访问）：
+```
+https://ssh.lamgc.me/
+```
+
+访问本页面（不使用 Curl 访问）：
+```
+https://ssh.lamgc.me/
 ```
 
 ## Install
