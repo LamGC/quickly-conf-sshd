@@ -83,7 +83,7 @@ export default {
     } else if (pathname === "/") {
       const userAgent = request.headers.get("User-Agent");
       if (userAgent != null && userAgent.match(/curl|libcurl/) !== null) {
-        return await sendScriptContent();
+        return await sendScriptContent(baseUrl);
       } else {
         return new Response("", {
           status: 301,
@@ -94,7 +94,7 @@ export default {
         });
       }
     } else if (pathname === "/script.sh") {
-      return await sendScriptContent();
+      return await sendScriptContent(baseUrl);
     } else {
       return new Response("Not found.", {
         status: 404,
