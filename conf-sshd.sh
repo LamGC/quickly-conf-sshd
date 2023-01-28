@@ -7,7 +7,7 @@ sshkey_url="https://q-ssh.lamgc.me/ssh.keys"
 # 默认的 Cron 执行计划, 每天凌晨 0 点执行
 default_cron="0 0 * * *"
 # 脚本 Url
-script_url="{{ script_url }}"
+script_url="https://q-ssh.lamgc.me"
 
 ############ 脚本区 ##########
 
@@ -201,8 +201,16 @@ if [ $(has_param "-c" "--cron") == "true" ]; then
         fi
         # 将当前脚本移动到 ~/.conf-sshd/conf-sshd.sh 中.
         mkdir -p ~/.conf-sshd
-        cp $0 ~/.conf-sshd/conf-sshd.sh
+        # 检查当前脚本是否为文件
+        if [ ! -f $0 ]; then
+            echo "Downloading conf-sshd script..."
+            curl -o ~/.conf-sshd/conf-sshd.sh $script_url
+        else 
+            echo "Copying conf-sshd script..."
+            cp $0 ~/.conf-sshd/conf-sshd.sh
+        fi
         chmod +x ~/.conf-sshd/conf-sshd.sh
+        echo "Install conf-sshd script successfully."
         # 将当前脚本添加到 Crontab 中
         echo "$cron /bin/bash ~/.conf-sshd/conf-sshd.sh -o -k $sshkey_url" | crontab -
     fi
