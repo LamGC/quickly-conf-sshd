@@ -43,21 +43,6 @@ get_param_value() {
     done
 }
 
-use_param_keys_url() {
-    local new_sshkey_url=$(get_param_value "-k" "--sshkey-url")
-    if [ "$new_sshkey_url" == "" ]; then
-        echo "Please specify the URL of the SSH public key."
-        exit 1
-    fi
-    sshkey_url=$new_sshkey_url
-    echo "A new SSH keys URL has been specified: $sshkey_url"
-}
-
-# 检查并更新 SSH key 地址.
-if [ $(has_param "-k" "--sshkey-url") == "true" ]; then
-    use_param_keys_url
-fi
-
 # 帮助信息.
 if [ $(has_param "-h" "--help") == "true" ]; then
     echo "Usage: $0 [options]"
@@ -65,7 +50,6 @@ if [ $(has_param "-h" "--help") == "true" ]; then
     echo "  -h, --help                              Print this help message."
     echo ""
     echo "Available to any user: "
-    echo "  -k, --sshkey-url                        The URL of the SSH public key."
     echo "  -c, --cron [cron | false]               Configure Crontab to automatically update ssh keys,"
     echo "                                          Cron expression can be specified, If false is specified, "
     echo "                                          Crontab settings will be deleted automatically."
@@ -211,8 +195,11 @@ if [ $(has_param "-c" "--cron") == "true" ]; then
         fi
         chmod +x ~/.conf-sshd/conf-sshd.sh
         echo "Install conf-sshd script successfully."
-        # 将当前脚本添加到 Crontab 中
-        echo "$cron /bin/bash ~/.conf-sshd/conf-sshd.sh -o -k $sshkey_url >> ~/.conf-sshd/run.log" | crontab -
+        # 将当前脚本追加到当前用户的 Crontab 中
+        crontab -l > ~/.conf-sshd/crontab.old
+        echo "$cron \"/bin/bash ~/.conf-sshd/conf-sshd.sh -o\" >> ~/.conf-sshd/run.log" >> ~/.conf-sshd/crontab.old
+        crontab ~/.conf-sshd/crontab.old
+        rm ~/.conf-sshd/crontab.old
         echo "Crontab has been configured.(Cron: '$cron')"
     fi
 fi
