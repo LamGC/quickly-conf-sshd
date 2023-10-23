@@ -79,7 +79,7 @@ update_sshkeys() {
     echo "-------------------- SSH Keys --------------------"
     echo "$ssh_keys"
     echo "--------------------------------------------------"
-    echo $ssh_keys > ~/.ssh/authorized_keys
+    echo "$ssh_keys" > ~/.ssh/authorized_keys
     chmod 600 ~/.ssh/authorized_keys
     # 输出更新成功，需要附带时间日期
     echo "SSH public key updated successfully at $(date '+%Y-%m-%d %H:%M:%S')"
