@@ -6,7 +6,7 @@
 - 定期自动更新 SSH 公钥到服务器中；
 - 集中管理注册到服务器的 SSH 公钥（例如使用 Github 管理 SSH 公钥）；
 
-## Usage
+## Quick Usage
 部署密钥并设置定期更新：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s -- -c
@@ -14,6 +14,10 @@ curl -s https://ssh.lamgc.me | bash -s -- -c
 如果不希望自动更新密钥，可以移除 `-c` 参数：
 ```bash
 curl -s https://ssh.lamgc.me | bash -s
+```
+跳过检查 SSH Server，只需要安装秘钥的话，就需要单独使用 `-o` 参数：
+```bash
+curl -s https://ssh.lamgc.me | bash -s -- -o
 ```
 添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH（需使用 Root 用户执行脚本）：
 ```bash
@@ -23,6 +27,8 @@ curl -s https://ssh.lamgc.me | bash -s -- -p yes
 ```bash
 curl -s https://ssh.lamgc.me | bash -s -- -h
 ```
+
+> Note: 更多用法请参见脚本帮助信息~
 
 ## Paths
 获取 SSH 公钥：
