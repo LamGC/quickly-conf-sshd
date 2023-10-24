@@ -9,23 +9,23 @@
 ## Quick Usage
 部署密钥并设置定期更新：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s -- -c
+curl -s https://ssh.nnn.cx | bash -s -- -c
 ```
 如果不希望自动更新密钥，可以移除 `-c` 参数：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s
+curl -s https://ssh.nnn.cx | bash -s
 ```
 跳过检查 SSH Server，只需要安装秘钥的话，就需要单独使用 `-o` 参数：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s -- -o
+curl -s https://ssh.nnn.cx | bash -s -- -o
 ```
 添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH（需使用 Root 用户执行脚本）：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s -- -p yes
+curl -s https://ssh.nnn.cx | bash -s -- -p yes
 ```
 要查看脚本的帮助信息，请使用 `-h` 参数：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s -- -h
+curl -s https://ssh.nnn.cx | bash -s -- -h
 ```
 
 > Note: 更多用法请参见脚本帮助信息~
@@ -33,22 +33,22 @@ curl -s https://ssh.lamgc.me | bash -s -- -h
 ## Paths
 获取 SSH 公钥：
 ```
-https://ssh.lamgc.me/ssh.keys
+https://ssh.nnn.cx/ssh.keys
 ```
 
 获取 Shell 脚本：
 ```
-https://ssh.lamgc.me/script.sh
+https://ssh.nnn.cx/script.sh
 ```
 
 获取 Shell 脚本（使用 Curl 访问）：
 ```
-https://ssh.lamgc.me/
+https://ssh.nnn.cx/
 ```
 
 访问本页面（不使用 Curl 访问）：
 ```
-https://ssh.lamgc.me/
+https://ssh.nnn.cx/
 ```
 
 ## Install
