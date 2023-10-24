@@ -19,6 +19,10 @@ curl -s https://ssh.nnn.cx | bash -s
 ```bash
 curl -s https://ssh.nnn.cx | bash -s -- -o
 ```
+跳过检查 SSH Server，只需要安装秘钥的话，就需要单独使用 `-o` 参数：
+```bash
+curl -s https://ssh.lamgc.me | bash -s -- -o
+```
 添加 `-p yes` 参数可以设置允许 Root 用户使用密码登录 SSH（需使用 Root 用户执行脚本）：
 ```bash
 curl -s https://ssh.nnn.cx | bash -s -- -p yes
