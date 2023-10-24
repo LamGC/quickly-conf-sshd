@@ -9,7 +9,7 @@
 ## Quick Usage
 部署密钥并设置定期更新：
 ```bash
-curl -s https://ssh.lamgc.me | bash -s -- -c
+curl -s https://ssh.nnn.cx | bash -s -- -c
 ```
 如果不希望自动更新密钥，可以移除 `-c` 参数：
 ```bash
