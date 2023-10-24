@@ -17,8 +17,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      #   with:
-      #     token: ${{ secrets.COMMIT_TOKEN }}
       - uses: actions/labeler@v4
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
@@ -31,8 +29,11 @@ jobs:
           git commit -m "更新个人访问地址"
           git push -u origin main
         env:
+          # 要替换的个人访问地址，例如：ssh.lamgc.me
           REPLACEMENT_VALUE: ${{ secrets.REPLACEMENT_VALUE }}
+          # Github用户名
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
+          # Github邮箱
           GIT_EMAIL: ${{ secrets.GIT_EMAIL }}
       - name: 提交更改
         uses: stefanzweifel/git-auto-commit-action@v4
