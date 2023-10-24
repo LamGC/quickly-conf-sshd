@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  # 使用 actions/github-script 向 README 文件写入个人访问地址。
+  # 使用 actions/github-script 向 README 文件写入个人访问地址，使用前参照脚本注释设置变量
   check-updates:
     timeout-minutes: 30
     runs-on: ubuntu-latest
@@ -19,6 +19,7 @@ jobs:
         uses: actions/checkout@v3
       - name: Setup Deploy Private Key
         env:
+          # 此处为ssh私钥的值，公钥放在Settings-Deploy keys-新建秘钥-填写进去
           DEPLOY_KEY: ${{secrets.DEPLOY_KEY}}
         run: |
           mkdir -p ~/.ssh/
@@ -35,8 +36,11 @@ jobs:
           git commit -m "更新个人访问地址"
           git push -u origin main
         env:
+          # 要替换的个人访问地址，例如：ssh.lamgc.me
           REPLACEMENT_VALUE: ${{ secrets.REPLACEMENT_VALUE }}
+          # Github用户名
           GIT_USERNAME: ${{ secrets.GIT_USERNAME }}
+          # Github邮箱
           GIT_EMAIL: ${{ secrets.GIT_EMAIL }}
       - name: Commit changes
         uses: stefanzweifel/git-auto-commit-action@v4
