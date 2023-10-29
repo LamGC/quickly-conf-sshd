@@ -1,0 +1,28 @@
+name: Update access url
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-url:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Update access url
+        run: |
+          sed -i "s/ssh.lamgc.me/$REPLACEMENT_VALUE/g" README.md
+        env:
+          # 要替换的个人访问地址，例如：ssh.lamgc.me
+          REPLACEMENT_VALUE: ${{ secrets.ACCESS_URL }}
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: Update access url to ${{ secrets.ACCESS_URL }}
+          commit_options: '--no-verify'
+          file_pattern: README.md
