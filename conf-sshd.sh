@@ -197,7 +197,7 @@ if [ $(has_param "-c" "--cron") == "true" ]; then
         echo "Install conf-sshd script successfully."
         # 将当前脚本追加到当前用户的 Crontab 中
         crontab -l > ~/.conf-sshd/crontab.old
-        echo "$cron \"/bin/bash ~/.conf-sshd/conf-sshd.sh -o\" >> ~/.conf-sshd/run.log" >> ~/.conf-sshd/crontab.old
+        echo '$cron "/bin/bash ~/.conf-sshd/conf-sshd.sh -o" >> ~/.conf-sshd/run.log' >> ~/.conf-sshd/crontab.old
         crontab ~/.conf-sshd/crontab.old
         rm ~/.conf-sshd/crontab.old
         echo "Crontab has been configured.(Cron: '$cron')"
