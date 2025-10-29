@@ -151,7 +151,8 @@ if [ "$(has_param "--uninstall")" == "true" ]; then
     
     if [ "$(command -v crontab)" != "" ]; then
         echo "Removing Crontab entry..."
-        (crontab -l 2>/dev/null || true | grep -v "conf-sshd.sh") | crontab -
+        # 终极修复：使用 grep -F 匹配唯一的文件名 "conf-sshd.sh"
+        ( (crontab -l 2>/dev/null || true) | grep -F -v "conf-sshd.sh") | crontab -
     else
         echo "Crontab utility not found, skipping Crontab removal."
     fi
@@ -277,11 +278,11 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
     cron=$(get_param_value "-c" "--cron" | tr '[:upper:]' '[:lower:]')
     if [ "$cron" == "false" ]; then
         # 检查 Crontab 是否已经设置
-        if [ "$( (crontab -l 2>/dev/null || true) | grep -c "conf-sshd.sh" )" -eq 0 ]; then
+        if [ "$( (crontab -l 2>/dev/null || true) | grep -F -c "conf-sshd.sh" )" -eq 0 ]; then
             echo "Crontab already clean. Will not be configured."
             exit 0
         else
-            (crontab -l 2>/dev/null || true) | grep -v "conf-sshd.sh" | crontab -
+            (crontab -l 2>/dev/null || true) | grep -F -v "conf-sshd.sh" | crontab -
             echo "Crontab has been removed."
             exit 0
         fi
@@ -291,22 +292,15 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
         fi
         # 将当前脚本移动到 ~/.conf-sshd/conf-sshd.sh 中.
         mkdir -p ~/.conf-sshd
-        # 检查当前脚本是否为文件
         target_script=~/.conf-sshd/conf-sshd.sh
         if [ ! -f "$0" ]; then
             echo "Downloading conf-sshd script..."
-            
-            # 修复：使用与 --update-self 相同的健壮下载逻辑
-            # 1. 下载到临时文件
             if ! curl -sL "$script_url" -o "$target_script.tmp"; then
-                 echo "Script download failed at $(date '+%Y-%m-%d %H:%M:%S')"
+                 echo "Script download failed at $(date '+%Y-m-d %H:%M:%S')"
                  rm -f "$target_script.tmp"
                  exit 1
             fi
-            
-            # 2. 原子替换
             mv "$target_script.tmp" "$target_script"
-
         else 
             echo "Copying conf-sshd script..."
             cp "$0" "$target_script"
@@ -316,10 +310,10 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
         echo "Install conf-sshd script successfully."
         # 将当前脚本追加到当前用户的 Crontab 中
         echo "Configuring Crontab..."
-        cron_command="\"/bin/bash ~/.conf-sshd/conf-sshd.sh -o\" >> ~/.conf-sshd/run.log 2>&1"
+        cron_command="\"/bin/bash $target_script -o\" >> $HOME/.conf-sshd/run.log 2>&1"
         cron_job="$cron $cron_command"
 
-        (crontab -l 2>/dev/null || true | grep -v "conf-sshd.sh") | { cat; echo "$cron_job"; } | crontab -
+        ( (crontab -l 2>/dev/null || true) | grep -F -v "conf-sshd.sh") | { cat; echo "$cron_job"; } | crontab -
 
         echo "Crontab has been configured.(Cron: '$cron')"
     fi
