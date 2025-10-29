@@ -292,14 +292,27 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
         # 将当前脚本移动到 ~/.conf-sshd/conf-sshd.sh 中.
         mkdir -p ~/.conf-sshd
         # 检查当前脚本是否为文件
+        target_script=~/.conf-sshd/conf-sshd.sh
         if [ ! -f "$0" ]; then
             echo "Downloading conf-sshd script..."
-            curl -oL ~/.conf-sshd/conf-sshd.sh "$script_url"
+            
+            # 修复：使用与 --update-self 相同的健壮下载逻辑
+            # 1. 下载到临时文件
+            if ! curl -sL "$script_url" -o "$target_script.tmp"; then
+                 echo "Script download failed at $(date '+%Y-%m-%d %H:%M:%S')"
+                 rm -f "$target_script.tmp"
+                 exit 1
+            fi
+            
+            # 2. 原子替换
+            mv "$target_script.tmp" "$target_script"
+
         else 
             echo "Copying conf-sshd script..."
-            cp "$0" ~/.conf-sshd/conf-sshd.sh
+            cp "$0" "$target_script"
         fi
-        chmod +x ~/.conf-sshd/conf-sshd.sh
+        
+        chmod +x "$target_script"
         echo "Install conf-sshd script successfully."
         # 将当前脚本追加到当前用户的 Crontab 中
         echo "Configuring Crontab..."
