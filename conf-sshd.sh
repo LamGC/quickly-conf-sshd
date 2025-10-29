@@ -80,7 +80,7 @@ update_sshkeys() {
 
     local dl_tmp_file=~/.ssh/authorized_keys.dl.tmp
     if ! curl -sL "$sshkey_url" -o "$dl_tmp_file"; then 
-        echo "Failed to download SSH public key at $(date '+%Y-m-d %H:%M:%S')"
+        echo "Failed to download SSH public key at $(date '+%Y-%m-%d %H:%M:%S')"
         rm -f "$dl_tmp_file"
         exit 1
     fi
@@ -109,14 +109,12 @@ update_sshkeys() {
     touch "$auth_file"
     true > "$new_auth_file"
 
-    # 逐行读取文件
     while IFS= read -r line; do
         if [ "$line" == "$begin_marker" ]; then
             managed_block_found=true
             inside_managed_block=true
             
             {
-                echo "" # 确保和前面的内容有空行
                 echo "$begin_marker"
                 cat "$dl_tmp_file"
                 echo "$end_marker"
@@ -130,8 +128,14 @@ update_sshkeys() {
     done < "$auth_file"
 
     if [ "$managed_block_found" == "false" ]; then
+        if [ -s "$new_auth_file" ]; then
+            if [ "$(tail -c 1 "$new_auth_file")" != "" ]; then
+                # 最后一个字符不是换行符，添加一个
+                echo "" >> "$new_auth_file"
+            fi
+        fi
+        
         {
-            echo "" # 确保和前面的内容有空行
             echo "$begin_marker"
             cat "$dl_tmp_file"
             echo "$end_marker"
@@ -141,25 +145,8 @@ update_sshkeys() {
     mv "$new_auth_file" "$auth_file"
     rm -f "$dl_tmp_file"
 
-    local final_tmp_file=~/.ssh/authorized_keys.final.tmp
-    
-    awk '
-        NR==FNR { 
-            if(NF>0) { 
-                if(first==0) first=NR; 
-                last=NR 
-            } 
-            next 
-        } 
-        FNR >= first && FNR <= last { 
-            print 
-        }
-    ' "$auth_file" "$auth_file" > "$final_tmp_file"
-    
-    mv "$final_tmp_file" "$auth_file"
-
     chmod 600 "$auth_file"
-    echo "SSH public key updated successfully (managed block only) at $(date '+%Y-m-d %H:%M:%S')"
+    echo "SSH public key updated successfully (managed block only) at $(date '+%Y-%m-%d %H:%M:%S')"
 }
 
 # 检查是否指定了 --uninstall
@@ -168,7 +155,6 @@ if [ "$(has_param "--uninstall")" == "true" ]; then
     
     if [ "$(command -v crontab)" != "" ]; then
         echo "Removing Crontab entry..."
-        # 终极修复：使用 grep -F 匹配唯一的文件名 "conf-sshd.sh"
         ( (crontab -l 2>/dev/null || true) | grep -F -v "conf-sshd.sh") | crontab -
     else
         echo "Crontab utility not found, skipping Crontab removal."
@@ -196,7 +182,7 @@ fi
 # 检查是否指定了 --update-self
 if [ "$(has_param "-u" "--update-self")" == "true" ]; then
     echo "Updating conf-sshd script..."
-    mkdir -p ~/.conf-sshd # 确保目录存在
+    mkdir -p ~/.conf-sshd
     target_script=~/.conf-sshd/conf-sshd.sh
 
     if [ -f "$target_script" ]; then
