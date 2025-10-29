@@ -141,6 +141,23 @@ update_sshkeys() {
     mv "$new_auth_file" "$auth_file"
     rm -f "$dl_tmp_file"
 
+    local final_tmp_file=~/.ssh/authorized_keys.final.tmp
+    
+    awk '
+        NR==FNR { 
+            if(NF>0) { 
+                if(first==0) first=NR; 
+                last=NR 
+            } 
+            next 
+        } 
+        FNR >= first && FNR <= last { 
+            print 
+        }
+    ' "$auth_file" "$auth_file" > "$final_tmp_file"
+    
+    mv "$final_tmp_file" "$auth_file"
+
     chmod 600 "$auth_file"
     echo "SSH public key updated successfully (managed block only) at $(date '+%Y-m-d %H:%M:%S')"
 }
