@@ -1,6 +1,5 @@
-#!/bin/bash
+#!/bin/sh
 set -e
-set -o pipefail
 
 ########## 一些配置 ##########
 
@@ -13,41 +12,58 @@ script_url="{{ SCRIPT_URL }}"
 
 ############ 脚本区 ##########
 
-script_params=("$@")
-has_param() {
-    for param in "${script_params[@]}"; do
-        for tParam in "$@"; do
-            if [ "$tParam" == "$param" ]; then
-                echo "true"
-                return
-            fi
-        done
-    done
-    echo "false"
-}
+# 初始化参数变量
+arg_help="false"
+arg_cron="false"
+arg_cron_val=""
+arg_only_update_keys="false"
+arg_update_self="false"
+arg_uninstall="false"
+arg_no_install_sshd="false"
+arg_allow_root_passwd="false"
+arg_allow_root_passwd_val=""
 
-get_param_value() {
-    local find=false
-    for param in "${script_params[@]}"; do
-        if [ "$find" == "true" ]; then
-            if [[ $param == -* ]]; then
-                return
-            fi
-
-            echo "$param" 
-            return
-        fi
-        for tParam in "$@"; do
-            if [ "$tParam" == "$param" ]; then
-                find=true
-                break
-            fi
-        done
-    done
-}
+# 解析参数
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            arg_help="true"
+            shift
+            ;;
+        -c|--cron)
+            arg_cron="true"
+            arg_cron_val="$2"
+            shift 2
+            ;;
+        -o|--only-update-keys)
+            arg_only_update_keys="true"
+            shift
+            ;;
+        -u|--update-self)
+            arg_update_self="true"
+            shift
+            ;;
+        --uninstall)
+            arg_uninstall="true"
+            shift
+            ;;
+        -n|--no-install-sshd)
+            arg_no_install_sshd="true"
+            shift
+            ;;
+        -p|--allow-root-passwd)
+            arg_allow_root_passwd="true"
+            arg_allow_root_passwd_val="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 # 帮助信息.
-if [ "$(has_param "-h" "--help")" == "true" ]; then
+if [ "$arg_help" = "true" ]; then
     echo "Usage: $0 [options]"
     echo "Options:"
     echo "  -h, --help                          Print this help message."
@@ -68,17 +84,33 @@ if [ "$(has_param "-h" "--help")" == "true" ]; then
     exit 0
 fi
 
-update_sshkeys() {
-    if [ "$sshkey_url" == "" ] || [[ "$sshkey_url" == "{{"* ]]; then
-        echo "ERROR: sshkey_url is not configured."
-        exit 1
+reload_sshd_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload sshd
+    elif command -v service >/dev/null 2>&1; then
+        service sshd reload || service ssh reload
+    elif [ -f /etc/init.d/sshd ]; then
+        /etc/init.d/sshd reload
+    elif [ -f /etc/init.d/ssh ]; then
+        /etc/init.d/ssh reload
+    else
+        return 1
     fi
+}
+
+update_sshkeys() {
+    case "$sshkey_url" in
+        ""|"{{"*)
+            echo "ERROR: sshkey_url is not configured."
+            exit 1
+            ;;
+    esac
 
     echo "Downloading SSH public key from '$sshkey_url'"
     mkdir -p ~/.ssh
     chmod 700 ~/.ssh
 
-    local dl_tmp_file=~/.ssh/authorized_keys.dl.tmp
+    dl_tmp_file="$HOME/.ssh/authorized_keys.dl.tmp"
     if ! curl -sL "$sshkey_url" -o "$dl_tmp_file"; then 
         echo "Failed to download SSH public key at $(date '+%Y-%m-%d %H:%M:%S')"
         rm -f "$dl_tmp_file"
@@ -96,23 +128,23 @@ update_sshkeys() {
     cat "$dl_tmp_file"
     echo "--------------------------------------------------"
     
-    local auth_file=~/.ssh/authorized_keys
-    local new_auth_file=~/.ssh/authorized_keys.new.tmp
+    auth_file="$HOME/.ssh/authorized_keys"
+    new_auth_file="$HOME/.ssh/authorized_keys.new.tmp"
     
     # 受管理文本块标记
-    local begin_marker="# --- BEGIN MANAGED BY CONF-SSHD SCRIPT ---"
-    local end_marker="# --- END MANAGED BY CONF-SSHD SCRIPT ---"
+    begin_marker="# --- BEGIN MANAGED BY CONF-SSHD SCRIPT ---"
+    end_marker="# --- END MANAGED BY CONF-SSHD SCRIPT ---"
 
-    local managed_block_found=false
-    local inside_managed_block=false
+    managed_block_found="false"
+    inside_managed_block="false"
 
     touch "$auth_file"
-    true > "$new_auth_file"
+    : > "$new_auth_file"
 
-    while IFS= read -r line; do
-        if [ "$line" == "$begin_marker" ]; then
-            managed_block_found=true
-            inside_managed_block=true
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$line" = "$begin_marker" ]; then
+            managed_block_found="true"
+            inside_managed_block="true"
             
             {
                 echo "$begin_marker"
@@ -120,14 +152,14 @@ update_sshkeys() {
                 echo "$end_marker"
             } >> "$new_auth_file"
             
-        elif [ "$line" == "$end_marker" ]; then
-            inside_managed_block=false
-        elif [ "$inside_managed_block" == "false" ]; then
+        elif [ "$line" = "$end_marker" ]; then
+            inside_managed_block="false"
+        elif [ "$inside_managed_block" = "false" ]; then
             echo "$line" >> "$new_auth_file"
         fi
     done < "$auth_file"
 
-    if [ "$managed_block_found" == "false" ]; then
+    if [ "$managed_block_found" = "false" ]; then
         if [ -s "$new_auth_file" ]; then
             if [ "$(tail -c 1 "$new_auth_file")" != "" ]; then
                 # 最后一个字符不是换行符，添加一个
@@ -150,7 +182,7 @@ update_sshkeys() {
 }
 
 # 检查是否指定了 --uninstall
-if [ "$(has_param "--uninstall")" == "true" ]; then
+if [ "$arg_uninstall" = "true" ]; then
     echo "Uninstalling conf-sshd (disabling auto-updates)..."
     
     if [ "$(command -v crontab)" != "" ]; then
@@ -174,16 +206,16 @@ if [ "$(has_param "--uninstall")" == "true" ]; then
 fi
 
 # 检查是否只更新密钥.
-if [ "$(has_param "-o" "--only-update-keys")" == "true" ]; then
+if [ "$arg_only_update_keys" = "true" ]; then
     update_sshkeys
     exit 0
 fi
 
 # 检查是否指定了 --update-self
-if [ "$(has_param "-u" "--update-self")" == "true" ]; then
+if [ "$arg_update_self" = "true" ]; then
     echo "Updating conf-sshd script..."
     mkdir -p ~/.conf-sshd
-    target_script=~/.conf-sshd/conf-sshd.sh
+    target_script="$HOME/.conf-sshd/conf-sshd.sh"
 
     if [ -f "$target_script" ]; then
         cp "$target_script" "$target_script.bak"
@@ -204,7 +236,7 @@ if [ "$(has_param "-u" "--update-self")" == "true" ]; then
 fi
 
 # 检查 SSHD 是否安装.
-if ! /usr/sbin/sshd -T > /dev/null 2>&1 && [ "$(has_param "-n" "--no-install-sshd")" == "false" ]; then
+if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ] && [ "$arg_no_install_sshd" = "false" ]; then
     if [ "$(id -u)" -eq 0 ]; then
         echo "The ssh server is not installed, and the script is executed as root, so it will be installed."
         if [ -f /etc/redhat-release ]; then
@@ -212,6 +244,8 @@ if ! /usr/sbin/sshd -T > /dev/null 2>&1 && [ "$(has_param "-n" "--no-install-ssh
         elif [ -f /etc/debian_version ]; then
             apt-get update
             apt-get install -y openssh-server
+        elif [ -f /etc/alpine-release ]; then
+            apk add openssh
         fi
         echo "The ssh server has been installed."
     else
@@ -223,18 +257,18 @@ else
 fi
 
 # 检查是否指定了 --allow-root-passwd
-if [ "$(has_param "-p" "--allow-root-passwd")" == "true" ]; then
+if [ "$arg_allow_root_passwd" = "true" ]; then
     # 检查当前用户是否为 root
     if [ "$(id -u)" -eq 0 ]; then
-        allow_root_passwd=$(get_param_value "-p" "--allow-root-passwd" | tr '[:upper:]' '[:lower:]')
+        allow_root_passwd=$(echo "$arg_allow_root_passwd_val" | tr '[:upper:]' '[:lower:]')
         
         sshd_config_file="/etc/ssh/sshd_config"
         new_sshd_permit_root_login_setting=""
 
-        if [ "$allow_root_passwd" == "yes" ]; then
+        if [ "$allow_root_passwd" = "yes" ]; then
             new_sshd_permit_root_login_setting="PermitRootLogin yes"
             echo "Setting: Root user is allowed to log in with password."
-        elif [ "$allow_root_passwd" == "no" ]; then
+        elif [ "$allow_root_passwd" = "no" ]; then
             new_sshd_permit_root_login_setting="PermitRootLogin prohibit-password"
             echo "Setting: Root user is prohibited from logging in with password."
         else
@@ -243,11 +277,19 @@ if [ "$(has_param "-p" "--allow-root-passwd")" == "true" ]; then
         fi
 
         if grep -qE '^#?PermitRootLogin' "$sshd_config_file"; then
-            sed -i "s@^#?PermitRootLogin.*@$new_sshd_permit_root_login_setting@g" "$sshd_config_file"
+            sed "s@^#\?PermitRootLogin.*@$new_sshd_permit_root_login_setting@g" "$sshd_config_file" > "$sshd_config_file.tmp" && mv "$sshd_config_file.tmp" "$sshd_config_file"
         else
             echo "$new_sshd_permit_root_login_setting" >> "$sshd_config_file"
         fi
-        echo "SSHD config updated. Please restart sshd service to apply changes."
+        
+        if ! reload_sshd_service; then
+            echo "----------------------------------------------------"
+            echo "WARNING: Failed to reload sshd service!"
+            echo "Please check service status manually."
+            echo "----------------------------------------------------"
+        else
+            echo "SSHD config updated. Now you can use password to login root user."
+        fi
 
     else
         echo "The script is executed as a non-root user and cannot set whether to allow root to log in with a password."
@@ -259,9 +301,9 @@ fi
 update_sshkeys
 
 # 检查是否指定了 --cron
-if [ "$(has_param "-c" "--cron")" == "true" ]; then
+if [ "$arg_cron" = "true" ]; then
     # 检查 Crontab 是否已安装
-    if [ "$(command -v crontab)" == "" ]; then
+    if [ "$(command -v crontab)" = "" ]; then
         if [ "$(id -u)" -eq 0 ]; then
             echo "The crontab is not installed, and the script is executed as a root user, so it will be installed."
             if [ -f /etc/redhat-release ]; then
@@ -269,6 +311,8 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
             elif [ -f /etc/debian_version ]; then
                 apt-get update
                 apt-get install -y cron
+            elif [ -f /etc/alpine-release ]; then
+                apk add cron
             fi
             echo "The crontab has been installed."
         else
@@ -278,8 +322,8 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
     else
         echo "The crontab is already installed."
     fi
-    cron=$(get_param_value "-c" "--cron" | tr '[:upper:]' '[:lower:]')
-    if [ "$cron" == "false" ]; then
+    cron=$(echo "$arg_cron_val" | tr '[:upper:]' '[:lower:]')
+    if [ "$cron" = "false" ]; then
         # 检查 Crontab 是否已经设置
         if [ "$( (crontab -l 2>/dev/null || true) | grep -F -c "conf-sshd.sh" )" -eq 0 ]; then
             echo "Crontab already clean. Will not be configured."
@@ -290,12 +334,12 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
             exit 0
         fi
     else
-        if [ "$cron" == "" ]; then
+        if [ "$cron" = "" ]; then
             cron=$default_cron
         fi
         # 将当前脚本移动到 ~/.conf-sshd/conf-sshd.sh 中.
         mkdir -p ~/.conf-sshd
-        target_script=~/.conf-sshd/conf-sshd.sh
+        target_script="$HOME/.conf-sshd/conf-sshd.sh"
         if [ ! -f "$0" ]; then
             echo "Downloading conf-sshd script..."
             if ! curl -sL "$script_url" -o "$target_script.tmp"; then
@@ -313,7 +357,7 @@ if [ "$(has_param "-c" "--cron")" == "true" ]; then
         echo "Install conf-sshd script successfully."
         # 将当前脚本追加到当前用户的 Crontab 中
         echo "Configuring Crontab..."
-        cron_command="\"/bin/bash $target_script -o\" >> $HOME/.conf-sshd/run.log 2>&1"
+        cron_command="/bin/sh $target_script -o >> $HOME/.conf-sshd/run.log 2>&1"
         cron_job="$cron $cron_command"
 
         ( (crontab -l 2>/dev/null || true) | grep -F -v "conf-sshd.sh") | { cat; echo "$cron_job"; } | crontab -
