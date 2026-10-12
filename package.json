@@ -1,0 +1,19 @@
+{
+  "name": "quickly-conf-sshd",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build": "node scripts/build.mjs",
+    "build:test": "node scripts/build.mjs --test-fixture",
+    "check": "npm test && npm run build:test"
+  },
+  "devDependencies": {
+    "playwright-core": "1.58.2",
+    "wrangler": "4.149.0"
+  }
+}

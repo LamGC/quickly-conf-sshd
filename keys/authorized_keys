@@ -1,0 +1,3 @@
+# Add independently managed SERVER public keys here, one ordinary OpenSSH key per line.
+# Do not copy private keys or automatically import GitHub account authentication keys.
+# Empty production releases are rejected unless deployment.json explicitly sets allowEmpty=true.

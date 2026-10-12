@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="查看当前已发布的 SSH 公钥，复制服务器配置命令。Quickly Configuring SSH Server。">
+    <title>SSH 公钥与快速部署 · Quickly Configuring SSH Server</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#public-keys">跳到 SSH 公钥</a>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="Quickly Configuring SSH Server 首页">
+          <span class="brand-mark" aria-hidden="true">&gt;_</span>
+          <span><strong>Quickly Configuring SSH Server</strong><span class="brand-caption">quickly-conf-sshd</span></span>
+        </a>
+        <nav class="header-actions" aria-label="项目与显示设置">
+          <div class="theme-control" data-enhance>
+            <label for="theme-picker">外观</label>
+            <select id="theme-picker" aria-label="选择页面外观">
+              <option value="system">跟随系统</option>
+              <option value="light">浅色</option>
+              <option value="dark">深色</option>
+            </select>
+          </div>
+          <a class="repository-link" href="@@REPOSITORY_URL@@" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span><span class="sr-only">（新窗口打开）</span></a>
+        </nav>
+      </header>
+
+      <main>
+        @@PREVIEW_NOTICE@@
+        <section class="hero" aria-labelledby="page-title">
+          <div class="hero-copy">
+            <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> SSH KEY DISTRIBUTION</p>
+            <h1 id="page-title">公钥集中管理，<br>服务器快速就绪。</h1>
+            <p class="hero-description">核对公钥，选择命令，配置 SSH。<br class="wide-only">查看当前公钥来源与内容版本，按需部署。</p>
+            <div class="hero-links"><a href="#public-keys">查看公钥 <span aria-hidden="true">↓</span></a><a href="#quick-start">快速开始 <span aria-hidden="true">↓</span></a></div>
+          </div>
+          <aside class="release-card" aria-labelledby="release-title">
+            <div class="release-heading"><h2 id="release-title">版本与公钥来源</h2><span class="release-badge">@@RELEASE_LABEL@@</span></div>
+            <dl class="release-details">
+              <div><dt>代码版本</dt><dd><code class="release-revision">@@REVISION@@</code></dd></div>
+              <div><dt>公钥版本</dt><dd><code class="release-revision">@@CONTENT_REVISION@@</code></dd></div>
+              <div><dt>公钥来源</dt><dd class="source-label">@@SOURCE_LABEL@@</dd></div>
+              <div><dt>来源状态</dt><dd class="source-status">@@SOURCE_STATUS@@</dd></div>
+              <div><dt>发布时间</dt><dd><time datetime="@@PUBLISHED_AT@@">@@PUBLISHED_AT@@</time></dd></div>
+              <div><dt>公开密钥</dt><dd><strong class="key-count">@@KEY_COUNT@@</strong><span class="count-unit"> 个</span></dd></div>
+            </dl>
+            <p class="release-note">此处展示代码发布与当前公钥来源，不代表所有服务器均已同步。</p>
+          </aside>
+        </section>
+
+        <section id="public-keys" class="content-section" aria-labelledby="keys-title">
+          <div class="section-heading">
+            <div><p class="section-index">01 / PUBLIC KEYS</p><h2 id="keys-title">SSH 公钥</h2><p>部署前，请核对指纹及密钥归属。</p></div>
+            <div class="section-actions"><a class="text-link" href="/ssh.keys">原始文件 <span aria-hidden="true">↗</span></a><button id="copy-all-keys" class="copy-button copy-all" type="button" aria-label="复制全部公钥" title="复制全部公钥" data-enhance><span>复制全部</span></button></div>
+          </div>
+          <p class="keys-notice" role="note">@@KEYS_NOTICE@@</p>
+          <div class="key-list">@@KEYS_HTML@@</div>
+          <div class="public-notice"><span class="notice-icon" aria-hidden="true">i</span><p>这里展示的是公开密钥。私钥应始终由你保管，本页面不会要求上传或输入私钥。</p></div>
+        </section>
+
+        <section id="quick-start" class="content-section commands-section" aria-labelledby="commands-title">
+          <div class="section-heading"><div><p class="section-index">02 / QUICK START</p><h2 id="commands-title">按需选择，复制即用</h2><p>以下命令会在你执行后修改服务器配置。请先检查脚本，并保留当前 SSH 会话以验证新连接。</p></div><a class="text-link" href="/script.sh">查看脚本 <span aria-hidden="true">↗</span></a></div>
+          <div class="command-list">@@COMMANDS_HTML@@</div>
+          <p class="command-note">每条命令独立使用。高级选项涉及 SSH 登录策略或卸载，请阅读说明后操作。</p>
+        </section>
+        <noscript><p class="noscript-notice">JavaScript 已关闭，公钥与命令仍可查看并手动选择复制。启用 JavaScript 后可使用复制按钮与外观设置。</p></noscript>
+      </main>
+
+      <footer class="site-footer"><span>Quickly Configuring SSH Server</span><div><a href="/ssh.keys">ssh.keys</a><a href="/script.sh">script.sh</a><a href="@@REPOSITORY_URL@@" target="_blank" rel="noopener noreferrer">源代码<span class="sr-only">（新窗口打开）</span></a></div></footer>
+    </div>
+
+    <p id="copy-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+    <dialog id="copy-fallback" aria-labelledby="fallback-title" aria-describedby="fallback-description">
+      <div class="fallback-heading"><h2 id="fallback-title">手动复制完整内容</h2><button id="close-copy-fallback" class="dialog-close" type="button" aria-label="关闭手动复制窗口">×</button></div>
+      <p id="fallback-description">浏览器未允许自动复制。内容已选中，请按 Ctrl+C 或 ⌘C，也可以长按文本进行复制。</p>
+      <label class="sr-only" for="fallback-text">要复制的完整内容</label>
+      <textarea id="fallback-text" readonly spellcheck="false" wrap="off"></textarea>
+      <p class="fallback-note">关闭此窗口后，可继续查看页面。</p>
+    </dialog>
+    <script id="release-data" type="application/json">@@RELEASE_JSON@@</script>
+  </body>
+</html>

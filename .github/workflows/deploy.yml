@@ -1,0 +1,40 @@
+name: Publish server key release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: production-key-release
+  cancel-in-progress: false
+jobs:
+  deploy:
+    # Deliberate opt-in prevents accidental deployment when this PR is merged.
+    # Configure production credentials and real server keys before enabling.
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_WORKER_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Install shell test interpreters
+        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+      - run: npm test
+        env:
+          BROWSER_TESTS: '1'
+      - name: Build production release (empty keys fail unless explicitly allowed)
+        run: npm run build
+      - run: node scripts/verify-release.mjs
+      - name: Deploy the validated production bundle
+        run: npx wrangler deploy --config cf-worker/wrangler.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Verify published revision and public key payload
+        run: node scripts/verify-release.mjs --remote
