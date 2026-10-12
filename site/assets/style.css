@@ -165,6 +165,11 @@ dialog::backdrop { background: rgb(10 22 15 / 52%); }
   .code-block > .copy-button { opacity: 0; transition: opacity 120ms ease; }
   .code-block:hover > .copy-button, .code-block:focus-within > .copy-button, .code-block > .copy-button[data-state="success"] { opacity: 1; }
 }
+/* Keep copies discoverable on touch/hybrid devices and narrow layouts, even
+   when the browser reports a fine pointer or changes its emulated media. */
+@media (hover: none), (pointer: coarse), (any-pointer: coarse), (max-width: 680px) {
+  .code-block > .copy-button { opacity: 1; transition: none; }
+}
 @media (max-width: 900px) {
   .page-shell { width: calc(100% - 56px); }
   .hero { grid-template-columns: 1fr 305px; gap: 36px; padding-block: 45px; }

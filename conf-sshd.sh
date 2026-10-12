@@ -54,7 +54,11 @@ select_mode() {
 }
 while [ "$#" -gt 0 ]; do
     case $1 in
-        -h|--help) [ "$#" -eq 1 ] && [ "$mode" = sync ] && [ "$cron_requested" = no ] || fail '--help must be used alone.'; usage; exit 0 ;;
+        -h|--help)
+            if [ "$#" -ne 1 ] || [ "$mode" != sync ] || [ "$cron_requested" != no ]; then
+                fail '--help must be used alone.'
+            fi
+            usage; exit 0 ;;
         -o|--only-update-keys) select_mode keys ;;
         -u|--update-self) select_mode update ;;
         --uninstall) select_mode uninstall ;;
@@ -219,9 +223,13 @@ sha256() {
 }
 check_expected_file() {
     if [ "$2" = absent ]; then
-        [ ! -e "$1" ] && [ ! -L "$1" ] || fail "File appeared concurrently; retry after reviewing: $1"
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            fail "File appeared concurrently; retry after reviewing: $1"
+        fi
     else
-        [ -f "$1" ] && cmp -s "$1" "$2" || fail "File changed concurrently; retry after reviewing: $1"
+        if [ ! -f "$1" ] || ! cmp -s "$1" "$2"; then
+            fail "File changed concurrently; retry after reviewing: $1"
+        fi
     fi
 }
 replace_file() {
@@ -394,17 +402,29 @@ sync_keys() {
         if [ "$positions" = absent ]; then
             cat "$auth_snapshot" > "$new_auth"
             if [ -s "$new_auth" ] && ! last_lf "$new_auth"; then printf '\n' >> "$new_auth"; fi
-            printf '%s\n' "$BEGIN_KEYS" >> "$new_auth"; cat "$payload" >> "$new_auth"; printf '%s\n' "$END_KEYS" >> "$new_auth"
+            {
+                printf '%s\n' "$BEGIN_KEYS"
+                cat "$payload"
+                printf '%s\n' "$END_KEYS"
+            } >> "$new_auth"
         else
             # Validated awk output: two decimal offsets.
             # shellcheck disable=SC2086
             set -- $positions
             dd if="$auth_snapshot" bs=1 count="$1" 2>/dev/null > "$new_auth"
-            printf '%s\n' "$BEGIN_KEYS" >> "$new_auth"; cat "$payload" >> "$new_auth"; printf '%s\n' "$END_KEYS" >> "$new_auth"
-            dd if="$auth_snapshot" bs=1 skip="$2" 2>/dev/null >> "$new_auth"
+            {
+                printf '%s\n' "$BEGIN_KEYS"
+                cat "$payload"
+                printf '%s\n' "$END_KEYS"
+                dd if="$auth_snapshot" bs=1 skip="$2" 2>/dev/null
+            } >> "$new_auth"
         fi
     else
-        printf '%s\n' "$BEGIN_KEYS" > "$new_auth"; cat "$payload" >> "$new_auth"; printf '%s\n' "$END_KEYS" >> "$new_auth"
+        {
+            printf '%s\n' "$BEGIN_KEYS"
+            cat "$payload"
+            printf '%s\n' "$END_KEYS"
+        } > "$new_auth"
     fi
     check_path "$auth_file" file
     check_expected_file "$auth_file" "$auth_snapshot"

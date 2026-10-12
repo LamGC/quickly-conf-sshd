@@ -223,3 +223,11 @@ test("CSS covers system theme, narrow viewports, touch copies, focus, and reduce
   assert.match(css, /prefers-reduced-motion/);
   assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|\beval\s*\(|\bfetch\s*\(/);
 });
+
+
+test("touch and narrow layouts explicitly override desktop copy-button hiding", () => {
+  const override = css.match(/@media \(hover: none\), \(pointer: coarse\), \(any-pointer: coarse\), \(max-width: 680px\) \{[\s\S]*?\n\}/);
+  assert.ok(override, "touch, hybrid, and narrow layouts need an explicit visibility rule");
+  assert.match(override[0], /\.code-block > \.copy-button \{ opacity: 1; transition: none; \}/);
+  assert.ok(override.index > css.indexOf("@media (hover: hover) and (pointer: fine)"), "touch visibility must win the CSS cascade");
+});
