@@ -7,6 +7,7 @@ import base64
 import struct
 import signal
 import os
+import re
 from pathlib import Path
 import shutil
 import shlex
@@ -56,6 +57,9 @@ class ShellTests(unittest.TestCase):
                         TEST_ROOT=str(self.root), TEST_RESPONSE=str(self.payload),
                         TEST_UPDATE=str(self.update), TEST_CRONTAB=str(self.cron),
                         TEST_CALLS=str(self.calls))
+        real_id = shutil.which('id')
+        self.assertIsNotNone(real_id)
+        self.mock('id', f'#!/bin/sh\nexec {shlex.quote(real_id)} "$@"\n')
         self.mock('curl', '''#!/bin/sh
 printf 'curl %s\\n' "$*" >> "$TEST_CALLS"
 [ "${TEST_CURL_ERROR:-0}" = 0 ] || exit "$TEST_CURL_ERROR"
@@ -88,12 +92,47 @@ fi
 
     def mock(self, name, text):
         path = self.bin / name
+        # Probes use invalid real-tool arguments, so a failed interception can
+        # never mutate the actual account or crontab. Every mock answers before
+        # its ordinary test-specific implementation runs.
+        first, rest = text.split('\n', 1)
+        text = (first + '\n'
+                'if [ "${1-}" = --conf-sshd-isolation-probe ]; then\n'
+                f'    printf \'%s\\n\' {shlex.quote("conf-sshd-mock:" + name)}\n'
+                '    exit 0\n'
+                'fi\n' + rest)
         path.write_text(text)
         path.chmod(0o700)
         return path
 
+    def isolation_prelude(self):
+        # BusyBox FEATURE_SH_STANDALONE may run applets before consulting PATH.
+        # Shell functions take precedence over applets, and an absolute mock
+        # path cannot resolve to an applet. Build fresh for every invocation so
+        # test-specific id/stat/cp/cat/dd/mv mocks are intercepted as well.
+        lines = []
+        for path in sorted(self.bin.iterdir()):
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', path.name):
+                lines.append(f'{path.name}() {{ {shlex.quote(str(path))} "$@"; }}')
+            # Hyphenated command names such as apt-get are not POSIX function
+            # identifiers and have no BusyBox applets; their PATH mocks remain.
+        for name in ('id', 'crontab'):
+            lines.extend([
+                f'if [ "$({name} --conf-sshd-isolation-probe)" != conf-sshd-mock:{name} ]; then',
+                f'    printf \'%s\\n\' \'TEST ISOLATION FAILED: {name} mock was bypassed\' >&2',
+                '    exit 97',
+                'fi',
+            ])
+        return '\n'.join(lines) + '\n'
+
+    def script_command(self, *args, script=None):
+        # Preserve the production script's arguments and $0 while loading it
+        # in a shell whose command resolution has passed the isolation probes.
+        return [*SHELL, '-c', self.isolation_prelude() + '. "$0"',
+                str(script or self.script), *args]
+
     def run_script(self, *args, ok=True, env=None, script=None):
-        completed = subprocess.run([*SHELL, str(script or self.script), *args],
+        completed = subprocess.run(self.script_command(*args, script=script),
                                    env=self.env | (env or {}), capture_output=True, text=True,
                                    timeout=15)
         if ok:
@@ -125,6 +164,23 @@ fi
         self.assertEqual(SOURCE.count('@@BASE_URL@@'), 1)
         self.assertEqual(SOURCE.count('@@DEFAULT_CRON@@'), 1)
         subprocess.run([*SHELL, '-n', str(self.script)], check=True)
+
+    def test_isolation_probe_aborts_before_installer_when_mock_is_bypassed(self):
+        for name in ('id', 'crontab'):
+            with self.subTest(name=name):
+                mock_path = self.bin / name
+                original = mock_path.read_text()
+                try:
+                    # Simulate a broken interception without calling real tools.
+                    mock_path.write_text('#!/bin/sh\nprintf "wrong-tool\\n"\n')
+                    result = self.run_script('-c', ok=False)
+                    self.assertEqual(result.returncode, 97)
+                    self.assertIn(f'TEST ISOLATION FAILED: {name}', result.stderr)
+                    self.assertFalse((self.home / '.conf-sshd').exists())
+                    self.assertFalse(self.auth.exists())
+                    self.assertEqual(self.calls.read_text(), '')
+                finally:
+                    mock_path.write_text(original)
 
     def test_default_sync_has_no_system_or_cron_side_effects(self):
         old_cron = self.cron.read_bytes()
@@ -383,7 +439,7 @@ fi
 
     def test_concurrent_run_refuses_and_signal_cleanup(self):
         env = self.env | {'TEST_CURL_WAIT': '1'}
-        first = subprocess.Popen([*SHELL, str(self.script), '-o'], env=env,
+        first = subprocess.Popen(self.script_command('-o'), env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 5
@@ -526,7 +582,7 @@ fi
     def test_piped_install_ignores_same_named_unrelated_cwd_file(self):
         decoy = self.root / 'sh'
         decoy.write_text(SCRIPT + '\n# UNTRUSTED CWD DECOY\n')
-        completed = subprocess.run([*SHELL, '-s', '--', '-c'], input=SCRIPT,
+        completed = subprocess.run([*SHELL, '-s', '--', '-c'], input=self.isolation_prelude() + SCRIPT,
                                    cwd=self.root, env=self.env, capture_output=True, text=True, timeout=15)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertNotIn('UNTRUSTED CWD DECOY', self.installed.read_text())
@@ -617,7 +673,7 @@ fi
         self.run_script('-u', ok=False)
 
     def test_signal_removes_own_lock_and_temporary_files(self):
-        first = subprocess.Popen([*SHELL, str(self.script), '-o'],
+        first = subprocess.Popen(self.script_command('-o'),
                                  env=self.env | {'TEST_CURL_WAIT': '1'},
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  start_new_session=True)

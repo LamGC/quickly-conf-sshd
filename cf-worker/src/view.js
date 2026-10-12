@@ -3,7 +3,7 @@ export const escapeHTML = value => String(value).replace(/[&<>"']/g, c => ({'&':
 export function commandsFor(config) {
   const fetch = `curl -fsSL '${config.baseUrl}/script.sh' | sh -s --`;
   return [
-    {id:'install',title:'安装并定时同步',description:'更新当前用户的公钥并设置定时同步；保留已有自定义计划，新安装默认每 15 分钟一次。',command:`${fetch} -c`},
+    {id:'install',title:'安装并定时同步',description:`更新当前用户的公钥并设置定时同步；保留已有自定义计划，新安装计划为 ${config.defaultCron || '*/15 * * * *'}。`,command:`${fetch} -c`},
     {id:'once',title:'仅更新一次公钥',description:'更新为当前发布的公钥，不设置定时任务。',command:`${fetch} -o`},
     {id:'help',title:'查看帮助',description:'先了解全部参数与行为，不修改配置。',command:`${fetch} -h`},
     {id:'preview',title:'预览公钥更新',description:'校验当前发布并预览将要修改的文件，不应用更新。',command:`${fetch} -o --dry-run`},

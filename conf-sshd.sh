@@ -30,7 +30,7 @@ usage() {
 Usage: sh conf-sshd.sh [options]
   (no options), -o, --only-update-keys  Validate and sync managed public keys only
   -c, --cron ["five fields"|false]     Sync and schedule; bare -c keeps an existing
-                                      schedule, otherwise every 15 minutes.
+                                      schedule, otherwise the configured default.
                                       -c false only removes this script's schedule.
   -u, --update-self                    Explicitly update the installed script only
   --uninstall                         Remove own schedule/script; preserve keys/config

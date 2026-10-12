@@ -37,7 +37,7 @@ test('HTML escapes comments; commands use explicit script endpoint and separate 
   const keys=await parseKeys(fixture.trim()+' <script>alert(1)</script>');
   const html=renderKeys(keys);assert.ok(html.includes('&lt;script&gt;'));assert.ok(!html.includes('<script>'));
   const commands=commandsFor(config);assert.ok(commands.find(x=>x.id==='install').command.endsWith(' -c'));
-  assert.ok(commands.find(x=>x.id==='root-on').advanced);assert.ok(commands.find(x=>x.id==='uninstall').advanced);
+  assert.ok(commands.find(x=>x.id==='root-on').advanced);assert.ok(commandsFor({...config,defaultCron:'0 */6 * * *'})[0].description.includes('0 */6 * * *'));assert.ok(commands.find(x=>x.id==='uninstall').advanced);
   assert.ok(commands.every(x=>!x.command.includes('github.io')&&!x.command.includes('.keys')));
 });
 test('build creates consistent assets/release; production empty is blocked',async()=>{
