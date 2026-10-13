@@ -15,12 +15,16 @@ import subprocess
 import tempfile
 import time
 import unittest
+import json
+import pty
+import select
+import errno
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'conf-sshd.sh').read_text()
 SHELL = shlex.split(os.environ.get('CONF_SSHD_TEST_SHELL', '/bin/sh'))
 ORIGIN = 'https://keys.example.test'
-SCRIPT = SOURCE.replace('@@BASE_URL@@', ORIGIN).replace('@@DEFAULT_CRON@@', '*/15 * * * *')
+SCRIPT = SOURCE.replace('@@BASE_URL@@', ORIGIN).replace('@@DEFAULT_CRON@@', '*/15 * * * *').replace('@@DEFAULT_GPG_VERIFY@@', 'off').replace('@@DEFAULT_GPG_FINGERPRINT@@', '').replace('@@DEFAULT_GPG_PIN_MODE@@', 'primary').replace('@@DEFAULT_LIST_ID@@', '').replace('@@DEFAULT_GPG_EMAIL@@', '')
 KEY = (ROOT / 'tests/fixtures/keys.pub').read_bytes().strip() + b'\n'
 BEGIN = b'# --- BEGIN MANAGED BY CONF-SSHD SCRIPT ---\n'
 END = b'# --- END MANAGED BY CONF-SSHD SCRIPT ---\n'
@@ -72,7 +76,17 @@ while [ "$#" -gt 0 ]; do
     case "$1" in --output) shift; out=$1 ;; https://*) url=$1 ;; esac
     shift
 done
-case $url in */ssh.keys) cp "$TEST_RESPONSE" "$out" ;; */script.sh) cp "$TEST_UPDATE" "$out" ;; *) exit 99 ;; esac
+status=${TEST_HTTP_STATUS:-200}
+case $url in
+    */script.sh) cp "$TEST_UPDATE" "$out" ;;
+    */public-key.gpg) cp "${TEST_CERTIFICATE:-/nonexistent}" "$out" || exit 22; status=${TEST_CERT_STATUS:-$status} ;;
+    */mirror/ssh.keys.sig) cp "${TEST_FALLBACK_SIGNATURE:-$TEST_SIGNATURE}" "$out"; status=${TEST_FALLBACK_SIG_STATUS:-$status} ;;
+    */mirror/ssh.keys) cp "${TEST_FALLBACK_RESPONSE:-$TEST_RESPONSE}" "$out"; status=${TEST_FALLBACK_KEY_STATUS:-$status} ;;
+    */ssh.keys.sig) cp "${TEST_SIGNATURE:-/nonexistent}" "$out" || exit 22; status=${TEST_SIG_STATUS:-$status} ;;
+    */ssh.keys) cp "$TEST_RESPONSE" "$out"; status=${TEST_KEY_STATUS:-$status} ;;
+    *) exit 99 ;;
+esac
+printf '%s' "$status"
 ''')
         self.mock('crontab', '''#!/bin/sh
 printf 'crontab %s\\n' "$*" >> "$TEST_CALLS"
@@ -233,7 +247,7 @@ fi
                 self.assertEqual(self.auth.read_bytes(), original)
                 self.assert_clean()
         calls = self.calls.read_text()
-        for option in ('--fail', '--proto =https', '--connect-timeout 10', '--max-time 30', '--retry 2'):
+        for option in ('--disable', '--fail', '--proto =https', '--connect-timeout 10', '--max-time 30', '--retry 0'):
             self.assertIn(option, calls)
         self.assertNotIn('--location', calls)
 
@@ -361,7 +375,7 @@ fi
         self.assertTrue(text.startswith(unrelated))
         self.assertIn("*/15 * * * * /bin/sh '", text)
         self.assertIn("'\\''quote/.conf-sshd/conf-sshd.sh' -o", text)
-        self.assertNotIn('-u', text)
+        self.assertNotRegex(text, r'(?:^|\s)-u(?:\s|$)')
         self.assertEqual(self.installed.stat().st_mode & 0o777, 0o700)
         text = text.replace('*/15 * * * *', '7 1 * * 2')
         self.cron.write_text(text)
@@ -476,12 +490,12 @@ fi
         for text in cases:
             with self.subTest(text=text[:40]):
                 self.update.write_text(text)
-                self.run_script('-u', ok=False)
+                self.run_script('--install', '--download-script', ok=False)
                 self.assertEqual(self.installed.read_bytes(), original)
                 self.assert_clean()
-        self.run_script('-u', ok=False, env={'TEST_CURL_ERROR': '22'})
+        self.run_script('--install', '--download-script', ok=False, env={'TEST_CURL_ERROR': '22'})
         self.update.write_text(SCRIPT + '\n# new release\n')
-        self.run_script('-u')
+        self.run_script('--install', '--download-script')
         self.assertEqual(self.installed.read_bytes(), self.update.read_bytes())
         self.assertEqual(Path(str(self.installed) + '.conf-sshd.bak').read_bytes(), original)
         self.assertEqual(self.auth.read_bytes(), keys)
@@ -668,9 +682,9 @@ fi
         self.run_script('-c')
         self.assertIn('8 3 * * * /bin/sh', self.cron.read_text())
         self.update.write_text(custom + '\n# updated\n')
-        self.run_script('-u')
+        self.run_script('--install', '--download-script')
         self.update.write_text(SCRIPT)
-        self.run_script('-u', ok=False)
+        self.run_script('--install', '--download-script', ok=False)
 
     def test_signal_removes_own_lock_and_temporary_files(self):
         first = subprocess.Popen(self.script_command('-o'),
@@ -721,5 +735,570 @@ fi
         self.assertFalse(self.auth.exists())
 
 
+class SignatureTests(ShellTests):
+    """Pure sandbox OpenPGP/TTY fixtures; all network paths intercepted."""
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture_dir = tempfile.TemporaryDirectory(prefix='conf-sshd-gpg-fixtures-')
+        js = r"""
+import {openPgpFixture} from './tests/helpers/openpgp-fixture.mjs';
+import {readFileSync} from 'node:fs';
+const f = openPgpFixture({subkeys:2}), other = openPgpFixture(), expired = openPgpFixture({expired:true}), revoked = openPgpFixture({revoked:true});
+const key=readFileSync('tests/fixtures/keys.pub','utf8').trim().split(/\s+/).slice(0,2).join(' ')+'\n';
+const now=Math.floor(Date.now()/1000);
+function doc({seq=5,list='fixture-list',issued=now-10,expires=now+3600,payload=key,revoke='no'}={}) {
+  return `# conf-sshd-signed-v1\n# list-id ${list}\n# sequence ${seq}\n# issued-at ${issued}\n# expires-at ${expires}\n# revoke ${revoke}\n# key-count ${payload ? payload.trim().split('\n').length : 0}\n# end-metadata\n${payload}`;
+}
+const specs={good:{},next:{seq:6},later:{seq:7,expires:now+7200},old:{seq:4},equivocation:{issued:now-9},expired:{seq:6,issued:now-3600,expires:now-1},future:{seq:6,issued:now+3600,expires:now+7200},wronglist:{seq:6,list:'another'},revoke:{seq:6,payload:'',revoke:'yes'},badrevoke:{seq:6,revoke:'yes'},comment:{seq:6,payload:key.trim()+' comment\n'}};
+const releases={}; for(const [name,spec] of Object.entries(specs)){const data=doc(spec);releases[name]={data,sig:f.sign(data)}}
+releases.sibling={data:doc({seq:6}),sig:f.sign(doc({seq:6}),1)};
+releases.textmode={data:doc({seq:6}),sig:f.signText(doc({seq:6}))};
+releases.wrongsigner={data:doc({seq:6}),sig:other.sign(doc({seq:6}))};
+console.log(JSON.stringify({publicKey:f.publicKey,primary:f.primaryFingerprint,subkeys:f.signerFingerprints,otherKey:other.publicKey,otherPin:other.primaryFingerprint,otherSig:other.sign(doc({seq:6})),expiredKey:expired.publicKey,expiredPin:expired.primaryFingerprint,expiredSig:expired.sign(doc()),revokedKey:revoked.publicKey,revokedPin:revoked.primaryFingerprint,revokedSig:revoked.sign(doc()),releases}));
+"""
+        generated = subprocess.run(['node', '--input-type=module', '-e', js], cwd=ROOT,
+                                   check=True, capture_output=True, text=True)
+        cls.fixtures = json.loads(generated.stdout)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture_dir.cleanup()
+
+    def setUp(self):
+        super().setUp()
+        self.cert = self.root / 'public-key.gpg'
+        self.cert.write_text(self.fixtures['publicKey'])
+        self.signature = self.root / 'ssh.keys.sig'
+        self.env.update(TEST_CERTIFICATE=str(self.cert), TEST_SIGNATURE=str(self.signature),
+                        GNUPGHOME=str(self.root / 'empty-ambient-home'))
+        self.set_release('good')
+        real_gpg = shutil.which('gpg')
+        self.assertIsNotNone(real_gpg)
+        # GnuPG cryptographic work is real. Remote GnuPG discovery never is.
+        self.mock('gpg', f'''#!/bin/sh
+printf 'gpg %s\\n' "$*" >> "$TEST_CALLS"
+home=; server=; action=
+prev=
+for arg do
+    case $prev in --homedir) home=$arg ;; --keyserver) server=$arg ;; esac
+    case $arg in --recv-keys|--locate-external-keys) action=$arg ;; esac
+    prev=$arg
+done
+if [ -n "$action" ]; then
+    if [ "${{TEST_DISCOVERY_SUCCESS:-}}" = "$server" ] || {{ [ "$action" = --locate-external-keys ] && [ "${{TEST_DISCOVERY_SUCCESS:-}}" = wkd ]; }}; then
+        "{real_gpg}" --batch --no-options --no-autostart --yes --dearmor --output "$home/pubring.gpg" "$TEST_CERTIFICATE" 2>/dev/null
+        exit $?
+    fi
+    exit 1
+fi
+exec "{real_gpg}" "$@"
+''')
+
+    def set_release(self, name):
+        value = self.fixtures['releases'][name]
+        self.payload.write_text(value['data'])
+        self.signature.write_text(value['sig'])
+
+    def run_tty(self, *args, answer=None, ok=True, env=None, script=None):
+        command = self.script_command(*args, script=script)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe(command[0], command, self.env | (env or {}))
+        output = bytearray()
+        sent = False
+        deadline = time.monotonic() + 20
+        code = None
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if ready:
+                    try:
+                        data = os.read(fd, 65536)
+                    except OSError as e:
+                        if e.errno != errno.EIO:
+                            raise
+                        data = b''
+                    output.extend(data)
+                if not sent and b'To confirm ' in output:
+                    os.write(fd, ((answer if answer is not None else self.fixtures['primary']) + '\n').encode())
+                    sent = True
+                result, status = os.waitpid(pid, os.WNOHANG)
+                if result:
+                    code = os.waitstatus_to_exitcode(status)
+                    break
+            if code is None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail('TTY fixture timed out: ' + output.decode(errors='replace'))
+        finally:
+            os.close(fd)
+        result = output.decode(errors='replace')
+        if ok:
+            self.assertEqual(code, 0, result)
+        else:
+            self.assertNotEqual(code, 0, result)
+        self.assertNotIn('UNEXPECTED', self.calls.read_text())
+        return result
+
+    def enroll(self, pin=None, mode='primary', extra=(), answer=None, ok=True):
+        pin = pin or self.fixtures['primary']
+        return self.run_tty('--install', '--gpg-verification', 'on', '--gpg-fingerprint', pin,
+                            '--gpg-pin-mode', mode, '--list-id', 'fixture-list', *extra,
+                            answer=answer or pin, ok=ok)
+
+    @property
+    def local_config(self):
+        return self.home / '.conf-sshd/local.conf'
+
+    @property
+    def replay(self):
+        return self.home / '.conf-sshd/replay.state'
+
+    def test_strict_primary_accepts_bound_subkeys_and_sync_is_offline_for_certificate(self):
+        self.enroll()
+        self.assertIn('policy required\n', self.local_config.read_text())
+        self.assertIn('sequence 5\n', self.replay.read_text())
+        self.assertEqual(self.auth.read_bytes(), BEGIN + b' '.join(KEY.split()[:2]) + b'\n' + END)
+        self.calls.write_text('')
+        self.set_release('sibling')
+        self.run_script('-o')
+        calls = self.calls.read_text()
+        self.assertIn('/ssh.keys.sig', calls)
+        self.assertNotIn('/public-key.gpg', calls)
+        self.assertNotIn('--recv-keys', calls)
+        self.assertNotIn('--locate-external-keys', calls)
+        self.assert_clean()
+
+    def test_strict_exact_subkey_rejects_sibling_and_other_signer(self):
+        self.enroll(pin=self.fixtures['subkeys'][0], mode='subkey')
+        original = self.auth.read_bytes()
+        for name in ('sibling', 'wrongsigner'):
+            self.set_release(name)
+            self.run_script('-o', ok=False)
+            self.assertEqual(self.auth.read_bytes(), original)
+        self.assert_clean()
+
+    def test_strict_rejects_rollback_equivocation_expiry_future_wronglist_and_unsigned(self):
+        self.enroll()
+        original = self.auth.read_bytes()
+        original_state = self.replay.read_bytes()
+        for name in ('old', 'equivocation', 'expired', 'future', 'wronglist', 'badrevoke', 'comment', 'wrongsigner', 'textmode'):
+            with self.subTest(name=name):
+                self.set_release(name)
+                self.run_script('-o', ok=False)
+                self.assertEqual(self.auth.read_bytes(), original)
+                self.assertEqual(self.replay.read_bytes(), original_state)
+                self.assert_clean()
+        self.payload.write_bytes(response())
+        self.signature.write_text('')
+        self.run_script('-o', ok=False)
+        self.assertEqual(self.auth.read_bytes(), original)
+
+    def test_strict_idempotent_replay_and_explicit_empty_revocation(self):
+        original = self.old_auth(b'# manual recovery key\n')
+        self.enroll()
+        self.run_script('-o')
+        self.set_release('revoke')
+        self.run_script('-o')
+        self.assertEqual(self.auth.read_bytes(), original + BEGIN + END)
+        self.assertIn('sequence 6\n', self.replay.read_text())
+        self.set_release('good')
+        self.run_script('-o', ok=False)
+        self.assertEqual(self.auth.read_bytes(), original + BEGIN + END)
+
+    def test_off_never_requests_signature_or_certificate_even_when_present(self):
+        self.signature.write_text('definitely invalid')
+        self.run_script('-o')
+        self.assertNotIn('/ssh.keys.sig', self.calls.read_text())
+        self.assertNotIn('/public-key.gpg', self.calls.read_text())
+        self.assertNotIn('gpg ', self.calls.read_text())
+        self.assertFalse(self.replay.exists())
+
+    def test_signature_requires_exact_http_200_and_exact_bytes(self):
+        self.enroll()
+        original = self.auth.read_bytes()
+        for status in ('201', '204', '206', '301', '404', '503'):
+            for key in ('TEST_KEY_STATUS', 'TEST_SIG_STATUS'):
+                with self.subTest(status=status, part=key):
+                    self.run_script('-o', ok=False, env={key:status})
+                    self.assertEqual(self.auth.read_bytes(), original)
+        self.payload.write_text(self.payload.read_text().replace('sequence 5', 'sequence 6'))
+        self.run_script('-o', ok=False)
+        self.assertEqual(self.auth.read_bytes(), original)
+
+    def test_cancel_no_tty_and_removed_bypass_preserve_targets_without_network(self):
+        original = self.old_auth()
+        self.enroll(answer='cancel', ok=False)
+        self.assertFalse(self.local_config.exists())
+        self.assertFalse(self.installed.exists())
+        self.assertEqual(self.auth.read_bytes(), original)
+        self.assertEqual(self.calls.read_text(), '')
+        self.run_script('--install', '--gpg-verification', 'on', '--gpg-fingerprint', self.fixtures['primary'], '--list-id', 'fixture-list', ok=False)
+        self.assertEqual(self.calls.read_text(), '')
+        self.run_script('--install', '--confirm-trust', self.fixtures['primary'], ok=False)
+        self.assertEqual(self.calls.read_text(), '')
+        self.assert_clean()
+
+    def test_bad_initial_signature_never_commits_script_config_certificate_or_state(self):
+        original = self.old_auth()
+        self.signature.write_text(self.fixtures['releases']['wrongsigner']['sig'])
+        self.enroll(ok=False)
+        self.assertEqual(self.auth.read_bytes(), original)
+        for path in (self.installed, self.local_config, self.replay):
+            self.assertFalse(path.exists())
+        self.assertEqual(list((self.home / '.conf-sshd').glob('trust-*.asc')), [])
+        self.assert_clean()
+
+    def test_missing_replay_or_pinned_certificate_fails_closed(self):
+        self.enroll()
+        original = self.auth.read_bytes()
+        saved = self.replay.read_bytes()
+        self.replay.unlink()
+        self.run_script('-o', ok=False)
+        self.assertEqual(self.auth.read_bytes(), original)
+        self.replay.write_bytes(saved)
+        next((self.home / '.conf-sshd').glob('trust-*.asc')).unlink()
+        self.run_script('-o', ok=False)
+        self.assertEqual(self.auth.read_bytes(), original)
+
+    def test_local_urls_fallback_order_and_signature_policy_never_downgrade(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.enroll(extra=('--fallback-urls-file', str(fallbacks)))
+        self.calls.write_text('')
+        self.run_script('-o', env={'TEST_KEY_STATUS':'503'})
+        calls = self.calls.read_text()
+        self.assertLess(calls.index(ORIGIN+'/ssh.keys'), calls.index(ORIGIN+'/mirror/ssh.keys'))
+        self.assertIn('/mirror/ssh.keys.sig', calls)
+        original = self.auth.read_bytes()
+        self.run_script('-o', ok=False, env={'TEST_SIG_STATUS':'404', 'TEST_FALLBACK_SIG_STATUS':'404'})
+        self.assertEqual(self.auth.read_bytes(), original)
+
+    def test_persisted_config_is_strict_data_never_executed(self):
+        self.enroll()
+        original = self.auth.read_bytes()
+        self.local_config.write_text(self.local_config.read_text() + 'touch ' + str(self.root/'PWNED') + '\n')
+        self.run_script('-o', ok=False)
+        self.assertFalse((self.root/'PWNED').exists())
+        self.assertEqual(self.auth.read_bytes(), original)
+
+    def test_floor_and_repository_defaults_require_consent(self):
+        self.enroll(extra=('--min-sequence','6'), ok=False)
+        self.assertFalse(self.replay.exists())
+        defaults = SCRIPT.replace("DEFAULT_GPG_VERIFY='off'", "DEFAULT_GPG_VERIFY='on'").replace("DEFAULT_GPG_FINGERPRINT=''", f"DEFAULT_GPG_FINGERPRINT='{self.fixtures['primary']}'").replace("DEFAULT_LIST_ID=''", "DEFAULT_LIST_ID='fixture-list'")
+        self.script.write_text(defaults)
+        self.run_script('-o', ok=False)
+        self.run_tty('-o', answer=self.fixtures['primary'])
+        self.assertFalse(self.installed.exists())
+        self.assertIn('policy required\n', self.local_config.read_text())
+        self.script.write_text(SCRIPT)
+        self.calls.write_text('')
+        self.run_script('-o')
+        self.assertIn('/ssh.keys.sig', self.calls.read_text())
+
+    def test_disable_requires_terminal_and_preserves_reenable_rollback_floor(self):
+        self.enroll()
+        original_config = self.local_config.read_bytes()
+        self.run_script('-o','--gpg-verification','off',ok=False)
+        self.assertEqual(self.local_config.read_bytes(), original_config)
+        self.run_tty('-o','--gpg-verification','off')
+        self.assertIn('policy off\n', self.local_config.read_text())
+        self.assertIn('sequence 5\n', self.replay.read_text())
+        self.set_release('old')
+        self.run_tty('-o','--gpg-verification','on',ok=False)
+        self.assertIn('policy off\n', self.local_config.read_text())
+
+    def test_explicit_reinstall_preserves_urls_pin_and_schedule(self):
+        self.enroll(extra=('-c','7 1 * * 2'))
+        before_config = self.local_config.read_bytes()
+        before_cron = self.cron.read_bytes()
+        old_script = self.installed.read_bytes()
+        self.script.write_text(SCRIPT + '\n# local verified release\n')
+        self.run_tty('--install')
+        self.assertEqual(self.local_config.read_bytes(), before_config)
+        self.assertEqual(self.cron.read_bytes(), before_cron)
+        self.assertEqual(self.installed.read_bytes(), self.script.read_bytes())
+        self.assertEqual(Path(str(self.installed)+'.conf-sshd.bak').read_bytes(), old_script)
+        self.run_script('-u',ok=False)
+        self.run_script('--install','--download-script',ok=False)
+        self.assert_clean()
+
+    def test_wrong_certificate_then_ordered_keyserver_fallback(self):
+        self.enroll(extra=('--gpg-email','fixture@example.invalid'), ok=True)
+        # A separate installation uses real cert parsing but all discovery mocked.
+        self.run_script('--uninstall')
+        self.local_config.unlink(); self.replay.unlink()
+        for path in (self.home/'.conf-sshd').glob('trust-*.asc'): path.unlink()
+        self.calls.write_text('')
+        self.run_tty('--install','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list','--gpg-email','fixture@example.invalid', env={'TEST_CERT_STATUS':'404','TEST_DISCOVERY_SUCCESS':'hkps://keyserver.ubuntu.com'})
+        calls=self.calls.read_text()
+        self.assertLess(calls.index('/public-key.gpg'),calls.index('--locate-external-keys'))
+        self.assertLess(calls.index('--locate-external-keys'),calls.index('hkps://keys.openpgp.org'))
+        self.assertLess(calls.index('hkps://keys.openpgp.org'),calls.index('hkps://keyserver.ubuntu.com'))
+        self.assert_clean()
+
+    def test_pending_journal_recovers_same_release_after_auth_replace_failure(self):
+        self.enroll()
+        self.set_release('next')
+        real_mv=shutil.which('mv')
+        self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+if [ "$last" = "$HOME/.ssh/authorized_keys" ]; then exit 74; fi
+exec "{real_mv}" "$@"
+''')
+        # Force a changed authorized_keys body, while retaining its manual lines.
+        self.old_auth(b'# existing manual\n')
+        self.run_script('-o',ok=False)
+        self.assertTrue((self.home/'.conf-sshd/pending.state').exists())
+        self.assertTrue((self.home/'.conf-sshd/pending.bundle').exists())
+        (self.bin/'mv').unlink()
+        self.set_release('old')
+        self.calls.write_text('')
+        self.run_script('-o')
+        self.assertIn('sequence 6\n',self.replay.read_text())
+        self.assertNotIn('curl ',self.calls.read_text())
+        self.assertFalse((self.home/'.conf-sshd/pending.state').exists())
+        self.assertFalse((self.home/'.conf-sshd/pending.bundle').exists())
+        self.assert_clean()
+
+    def test_wrong_expired_revoked_and_multiple_certificate_rejected(self):
+        for name in ('other','expired','revoked'):
+            with self.subTest(name=name):
+                self.cert.write_text(self.fixtures[name+'Key'])
+                pin=self.fixtures[name+'Pin'] if name!='other' else self.fixtures['primary']
+                self.enroll(pin=pin,ok=False)
+                self.assertFalse(self.installed.exists())
+                self.assertFalse(self.local_config.exists())
+                self.assert_clean()
+        self.cert.write_text(self.fixtures['publicKey']+self.fixtures['otherKey'])
+        self.enroll(ok=False)
+        self.assertFalse(self.installed.exists())
+
+
+    def test_signed_pipe_install_requires_tty_then_installs_downloaded_release(self):
+        defaults = SCRIPT.replace("DEFAULT_GPG_VERIFY='off'", "DEFAULT_GPG_VERIFY='on'").replace("DEFAULT_GPG_FINGERPRINT=''", f"DEFAULT_GPG_FINGERPRINT='{self.fixtures['primary']}'").replace("DEFAULT_LIST_ID=''", "DEFAULT_LIST_ID='fixture-list'")
+        self.update.write_text(defaults)
+        wrapper = self.root/'pipe-bootstrap.sh'
+        prelude = shlex.quote(self.isolation_prelude())
+        wrapper.write_text(f"{{ printf '%s' {prelude}; cat {shlex.quote(str(self.update))}; }} | {shlex.join(SHELL)} -s -- --install --download-script -c\n")
+        self.run_script(script=wrapper,ok=False)
+        self.assertFalse(self.installed.exists())
+        self.assertNotIn('curl ',self.calls.read_text())
+        self.run_tty(script=wrapper)
+        self.assertEqual(self.installed.read_text(),defaults)
+        self.assertIn('policy required\n',self.local_config.read_text())
+        self.assertIn('/ssh.keys.sig',self.calls.read_text())
+        self.assertIn('/script.sh',self.calls.read_text())
+        self.assert_clean()
+
+    def test_machine_status_rejects_weak_digest_text_signature_wrong_primary_and_errors(self):
+        self.enroll()
+        original=self.auth.read_bytes()
+        real_gpg=shutil.which('gpg')
+        self.mock('gpg',f'''#!/bin/sh
+for arg do
+    if [ "$arg" = --verify ]; then cat "$TEST_FAKE_STATUS"; exit 0; fi
+done
+exec "{real_gpg}" "$@"
+''')
+        path=self.root/'status-fixture'
+        signer=self.fixtures['subkeys'][0]
+        primary=self.fixtures['primary']
+        good=f'[GNUPG:] VALIDSIG {signer} 2026-01-01 {int(time.time())-10} 0 4 0 1 8 00 {primary}\n'
+        cases=[good.replace(' 8 00 ',' 11 00 '),good.replace(' 8 00 ',' 8 01 '),
+               good.replace(' 0 4 0 ',' 1 4 0 '),good.replace(' 0 4 0 ',' 0 5 0 '),
+               good.rstrip()+' extra\n',good.rsplit(' ',1)[0]+'\n',
+               good+good,good+'[GNUPG:] KEYREVOKED\n',good+'[GNUPG:] BADARMOR\n',
+               f'[GNUPG:] GOODSIG {signer[-16:]} fixture\n']
+        for status in cases:
+            with self.subTest(status=status):
+                path.write_text(status)
+                self.run_script('-o',ok=False,env={'TEST_FAKE_STATUS':str(path)})
+                self.assertEqual(self.auth.read_bytes(),original)
+                self.assert_clean()
+
+    def test_rotation_preserves_sequence_and_explicit_floor_cannot_lower_it(self):
+        self.enroll()
+        original=self.local_config.read_bytes()
+        self.cert.write_text(self.fixtures['otherKey'])
+        self.payload.write_text(self.fixtures['releases']['next']['data'])
+        self.signature.write_text(self.fixtures['otherSig'])
+        self.enroll(pin=self.fixtures['otherPin'])
+        self.assertNotEqual(self.local_config.read_bytes(),original)
+        self.assertIn('sequence 6\n',self.replay.read_text())
+        self.enroll(pin=self.fixtures['otherPin'],extra=('--min-sequence','5'),ok=False)
+        self.assertIn('sequence 6\n',self.replay.read_text())
+        self.enroll(pin=self.fixtures['otherPin'],extra=('--min-sequence','7'),ok=False)
+        self.assertIn('sequence 6\n',self.replay.read_text())
+        self.assert_clean()
+
+    def test_missing_policy_does_not_reset_security_to_off(self):
+        self.enroll()
+        original=self.auth.read_bytes()
+        self.local_config.unlink()
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.auth.read_bytes(),original)
+
+    def test_worker_certificate_failure_can_use_pinned_local_public_ring_without_mutation(self):
+        ambient=self.root/'local-public-ring'
+        ambient.mkdir(mode=0o700)
+        subprocess.run(['gpg','--batch','--no-options','--no-autostart','--yes','--dearmor','--output',str(ambient/'pubring.gpg'),str(self.cert)],check=True,capture_output=True)
+        before={x.name:x.read_bytes() for x in ambient.iterdir()}
+        self.run_tty('--install','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list',env={'GNUPGHOME':str(ambient),'TEST_CERT_STATUS':'404'})
+        self.assertNotIn('/public-key.gpg',self.calls.read_text())
+        self.assertEqual({x.name:x.read_bytes() for x in ambient.iterdir()},before)
+        self.assert_clean()
+
+    def test_corrupt_pending_package_blocks_reset_and_preserves_keys(self):
+        self.enroll()
+        original=self.auth.read_bytes()
+        pending=self.home/'.conf-sshd/pending.bundle'
+        pending.write_text('invalid\n')
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.auth.read_bytes(),original)
+        self.assertTrue(pending.exists())
+        self.assertIn('sequence 5\n',self.replay.read_text())
+
+
+    def test_expired_pending_is_not_applied_but_higher_fresh_release_can_progress(self):
+        self.enroll()
+        self.set_release('next')
+        real_mv=shutil.which('mv')
+        self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+if [ "$last" = "$HOME/.ssh/authorized_keys" ]; then exit 74; fi
+exec "{real_mv}" "$@"
+''')
+        self.old_auth(b'# retained manual key\n')
+        self.run_script('-o',ok=False)
+        original=self.auth.read_bytes()
+        (self.bin/'mv').unlink()
+        now=int(time.time())+3700
+        self.mock('date',f'#!/bin/sh\nprintf "%s\\n" "{now}"\n')
+        self.set_release('old')
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.auth.read_bytes(),original)
+        self.assertTrue((self.home/'.conf-sshd/pending.state').exists())
+        self.set_release('later')
+        self.run_script('-o')
+        self.assertIn('sequence 7\n',self.replay.read_text())
+        self.assertFalse((self.home/'.conf-sshd/pending.state').exists())
+        self.assertTrue(self.auth.read_bytes().startswith(original))
+        self.assert_clean()
+
+    def test_missing_security_state_does_not_block_stop_cron_or_uninstall(self):
+        self.enroll(extra=('-c',))
+        original=self.auth.read_bytes()
+        self.replay.unlink()
+        self.run_script('-c','false')
+        self.assertNotIn(CB,self.cron.read_text())
+        self.local_config.write_text('malformed but cleanup should work\n')
+        self.run_script('--uninstall')
+        self.assertFalse(self.installed.exists())
+        self.assertEqual(self.auth.read_bytes(),original)
+
+    def test_reinstall_reuses_dedicated_certificate_before_worker_and_keyservers(self):
+        self.enroll()
+        self.calls.write_text('')
+        self.run_tty('--install',env={'TEST_CERT_STATUS':'404'})
+        calls=self.calls.read_text()
+        self.assertNotIn('/public-key.gpg',calls)
+        self.assertNotIn('--recv-keys',calls)
+        self.assertNotIn('--locate-external-keys',calls)
+        self.assert_clean()
+
+    def test_wkd_lookup_is_optional_bounded_and_stops_before_keyservers(self):
+        self.run_tty('--install','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list','--gpg-email','fixture@example.invalid',env={'TEST_CERT_STATUS':'404','TEST_DISCOVERY_SUCCESS':'wkd'})
+        calls=self.calls.read_text()
+        self.assertIn('--locate-external-keys -- fixture@example.invalid',calls)
+        self.assertNotIn('--recv-keys',calls)
+        self.assert_clean()
+
+    def test_keyserver_override_replaces_builtins_and_remains_after_reinstall(self):
+        server='hkps://keys.fixture.invalid'
+        self.run_tty('--install','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list','--keyserver',server,env={'TEST_CERT_STATUS':'404','TEST_DISCOVERY_SUCCESS':server})
+        calls=self.calls.read_text()
+        self.assertIn('--keyserver '+server,calls)
+        self.assertNotIn('--keyserver hkps://keys.openpgp.org',calls)
+        self.assertNotIn('--keyserver hkps://keyserver.ubuntu.com',calls)
+        self.assertIn('keyserver '+server+'\n',self.local_config.read_text())
+        self.assertNotIn('keys.openpgp.org',self.local_config.read_text())
+
+
+    def test_failed_script_upgrade_never_activates_on_policy_over_legacy_script(self):
+        self.installed.parent.mkdir(mode=0o700)
+        self.installed.write_text('#!/bin/sh\n# legacy client without verification\n')
+        old_script=self.installed.read_bytes()
+        old_keys=self.old_auth()
+        real_mv=shutil.which('mv')
+        self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+if [ "$last" = "$HOME/.conf-sshd/conf-sshd.sh" ]; then exit 74; fi
+exec "{real_mv}" "$@"
+''')
+        self.enroll(ok=False)
+        self.assertEqual(self.installed.read_bytes(),old_script)
+        self.assertEqual(self.auth.read_bytes(),old_keys)
+        self.assertFalse(self.local_config.exists())
+        self.assertFalse(self.replay.exists())
+        self.assertEqual(list(self.installed.parent.glob('trust-*.asc')),[])
+
+    def test_keys_only_enrollment_refuses_to_leave_legacy_scheduled_executable(self):
+        self.installed.parent.mkdir(mode=0o700)
+        self.installed.write_text('#!/bin/sh\n# old script\n')
+        self.run_tty('-o','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list',ok=False)
+        self.assertFalse(self.local_config.exists())
+        self.assertNotIn('curl ',self.calls.read_text())
+
+    def test_install_cron_false_preserves_policy_and_never_uses_cleanup_bypass(self):
+        self.enroll(extra=('-c',))
+        original=self.local_config.read_bytes()
+        self.run_tty('--install','-c','false')
+        self.assertEqual(self.local_config.read_bytes(),original)
+        self.assertNotIn(CB,self.cron.read_text())
+        fresh=self.root/'other-home'
+        fresh.mkdir(mode=0o700)
+        self.run_script('--install','-c','false',env={'HOME':str(fresh)})
+        self.assertIn('policy off\n',(fresh/'.conf-sshd/local.conf').read_text())
+
+    def test_missing_dedicated_certificate_can_be_recovered_by_explicit_install(self):
+        self.enroll()
+        next((self.home/'.conf-sshd').glob('trust-*.asc')).unlink()
+        self.run_tty('--install')
+        self.assertTrue(next((self.home/'.conf-sshd').glob('trust-*.asc')).exists())
+        self.assertIn('sequence 5\n',self.replay.read_text())
+
+
+    def test_certificate_export_failure_continues_to_next_discovery_source(self):
+        wrapper=self.bin/'gpg'
+        text=wrapper.read_text()
+        needle='home=; server=; action=\n'
+        injected="""if [ \"${TEST_FAIL_FIRST_EXPORT:-0}\" = 1 ]; then
+    for arg do
+        if [ \"$arg\" = --export ] && [ ! -f \"$TEST_ROOT/export-failed-once\" ]; then
+            : > \"$TEST_ROOT/export-failed-once\"
+            exit 1
+        fi
+    done
+fi
+"""
+        self.assertIn(needle,text)
+        wrapper.write_text(text.replace(needle,injected+needle,1))
+        self.run_tty('--install','--gpg-verification','on','--gpg-fingerprint',self.fixtures['primary'],'--list-id','fixture-list',env={'TEST_FAIL_FIRST_EXPORT':'1','TEST_DISCOVERY_SUCCESS':'hkps://keys.openpgp.org'})
+        calls=self.calls.read_text()
+        self.assertIn('/public-key.gpg',calls)
+        self.assertIn('--keyserver hkps://keys.openpgp.org --recv-keys',calls)
+        self.assertTrue((self.root/'export-failed-once').exists())
+        self.assertTrue(self.installed.exists())
+        self.assert_clean()
+
+
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    suite=unittest.TestSuite()
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ShellTests))
+    suite.addTests(SignatureTests(name) for name in SignatureTests.__dict__ if name.startswith('test_'))
+    result=unittest.TextTestRunner(verbosity=2).run(suite)
+    raise SystemExit(not result.wasSuccessful())

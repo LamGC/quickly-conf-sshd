@@ -3,5 +3,15 @@
   "repositoryUrl": "https://github.com/LamGC/quickly-conf-sshd",
   "defaultCron": "*/15 * * * *",
   "allowEmpty": false,
-  "fallbackSources": []
+  "fallbackSources": [],
+  "keySource": {
+    "type": "git"
+  },
+  "clientDefaults": {
+    "gpgVerification": "off",
+    "fingerprint": "",
+    "pinMode": "primary",
+    "listId": "",
+    "email": ""
+  }
 }

@@ -4,9 +4,10 @@ import {readFile,mkdtemp,cp,writeFile,rm,mkdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {renderPage} from '../cf-worker/src/view.js';
-import {validateConfig,parseKeys,makeKeysText,commandsFor,renderKeys,build,root,digest} from '../scripts/build.mjs';
+import {validateConfig,parseKeys,makeKeysText,commandsFor,build,root,digest} from '../scripts/build.mjs';
 const config = {baseUrl:'https://ssh.example.com',repositoryUrl:'https://github.com/example/keys',defaultCron:'*/15 * * * *',allowEmpty:false};
 const fixture = await readFile(new URL('./fixtures/keys.pub',import.meta.url),'utf8');
+const canonicalFixture=fixture.trim().split(/ +/).slice(0,2).join(' ')+'\n';
 
 test('deployment configuration rejects shell injection and ambiguous origins',()=>{
   assert.deepEqual(validateConfig(config),config);
@@ -30,15 +31,18 @@ test('empty revocation must be explicit; protocol is deterministic',async()=>{
   const empty = makeKeysText([], 'a'.repeat(40),true);
   assert.match(empty.text,/# key-count 0\n# allow-empty yes\n/);assert.equal(empty.sha256,digest(''));
   const keys=await parseKeys(fixture);const bundle=makeKeysText(keys,'b'.repeat(40),false);
-  assert.ok(bundle.text.endsWith(fixture));assert.equal(bundle.sha256,digest(fixture));
+  assert.ok(bundle.text.endsWith(canonicalFixture));assert.equal(bundle.sha256,digest(canonicalFixture));
   assert.throws(()=>makeKeysText(keys,'main',false),/commit SHA/);
 });
-test('HTML escapes comments; commands use explicit script endpoint and separate actions',async()=>{
-  const keys=await parseKeys(fixture.trim()+' <script>alert(1)</script>');
-  const html=renderKeys(keys);assert.ok(html.includes('&lt;script&gt;'));assert.ok(!html.includes('<script>'));
-  const commands=commandsFor(config);assert.ok(commands.find(x=>x.id==='install').command.endsWith(' -c'));
-  assert.ok(commands.find(x=>x.id==='root-on').advanced);assert.ok(commandsFor({...config,defaultCron:'0 */6 * * *'})[0].description.includes('0 */6 * * *'));assert.ok(commands.find(x=>x.id==='uninstall').advanced);
-  assert.ok(commands.every(x=>!x.command.includes('github.io')&&!x.command.includes('.keys')));
+test('homepage excludes keys and commands use explicit install and fixed local sync',async()=>{
+  const commands=commandsFor(config);
+  assert.ok(commands.find(x=>x.id==='install').command.includes('--install'));
+  assert.ok(commands.find(x=>x.id==='root-on').advanced);
+  assert.ok(commandsFor({...config,defaultCron:'0 */6 * * *'})[0].description.includes('0 */6 * * *'));
+  assert.ok(commands.find(x=>x.id==='uninstall').advanced);
+  assert.ok(commands.every(x=>!x.command.includes('github.io')));
+  assert.ok(!commands.some(x=>/ -u$/.test(x.command)));
+  assert.ok(commands.find(x=>x.id==='once').command.includes('$HOME/.conf-sshd/conf-sshd.sh'));
 });
 test('build creates consistent assets/release; production empty is blocked',async()=>{
   const directory=await mkdtemp(join(tmpdir(),'conf-sshd-build-'));
@@ -73,12 +77,12 @@ test('fallback configuration allows an empty primary only with explicit bounded 
   } finally {await rm(directory,{recursive:true,force:true});}
 });
 
-test('template rendering preserves literal dollar replacements and token-like key comments',async()=>{
+test('template rendering excludes even adversarial key comments from HTML and JSON',async()=>{
   const tricky=fixture.trim()+" $& $` $' $$ @@REVISION@@ @@KEYS_HTML@@";
   const keys=await parseKeys(tricky);
-  const template='<div>@@KEYS_HTML@@</div><script type="application/json">@@RELEASE_JSON@@</script>';
+  const template='<div>@@SOURCE_LABEL@@</div><script type="application/json">@@RELEASE_JSON@@</script>';
   const html=renderPage(template,{revision:'e'.repeat(40),publishedAt:'2026-10-12',keys,commands:[],repositoryUrl:config.repositoryUrl,sha256:'f'.repeat(64)});
   const json=JSON.parse(html.match(/<script type="application\/json">([\s\S]*?)<\/script>/)[1]);
-  assert.equal(json.keys[0].text,tricky);assert.ok(html.includes('@@KEYS_HTML@@'));assert.ok(html.includes('$&amp;'));
+  assert.equal(json.keys,undefined);assert.ok(!html.includes(keys[0].text));assert.ok(!html.includes(keys[0].fingerprint));
   assert.throws(()=>renderPage('@@UNKNOWN@@',{revision:'e'.repeat(40),keys:[]}),/Unresolved/);
 });

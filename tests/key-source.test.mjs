@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {createHash, generateKeyPairSync} from 'node:crypto';
 import {FallbackUnavailableError, KEY_SOURCE_LIMITS, makeKeyBundle, parsePublicKeys, resolveKeys, validateFallbackSources} from '../cf-worker/src/key-source.js';
+import {SIGNED_BUNDLE_MAX_BYTES, makeSignedDocument, SIGNATURE_SEPARATOR} from '../cf-worker/src/signed-release.js';
 
 const fixture = await readFile(new URL('./fixtures/keys.pub', import.meta.url), 'utf8');
+const canonical = fixture.trim().split(/\s+/).slice(0, 2).join(' ') + '\n';
 const revision = 'a'.repeat(40);
 const urls = ['https://keys.example.org/first.keys', 'https://keys.example.org/second.keys', 'https://keys.example.org/third.keys'];
 const emptyRelease = {keys: [], allowEmpty: false, revision, fallbackSources: urls};
@@ -33,9 +35,9 @@ test('repository keys win without any upstream request and have complete protoco
   assert.deepEqual(result.source, {type: 'repository'});
   assert.equal(result.revision, revision);
   assert.equal(result.keyCount, 1);
-  assert.equal(result.sha256, hash(fixture));
+  assert.equal(result.sha256, hash(canonical));
   assert.equal(result.keyRevision, result.sha256);
-  assert.equal(result.keysText, `# conf-sshd-v1\n# revision ${revision}\n# key-count 1\n# allow-empty no\n# sha256 ${hash(fixture)}\n# end-metadata\n${fixture}`);
+  assert.equal(result.keysText, `# conf-sshd-v1\n# revision ${revision}\n# key-count 1\n# allow-empty no\n# sha256 ${hash(canonical)}\n# end-metadata\n${canonical}`);
   assert.ok(Number.isFinite(Date.parse(result.fetchedAt)));
 });
 
@@ -61,7 +63,7 @@ test('first valid nonempty source wins in order, without aggregation or redirect
   assert.deepEqual(visited, [urls[0]]);
   assert.deepEqual(result.source, {type: 'fallback', url: urls[0]});
   assert.equal(result.keyCount, 1);
-  assert.equal(result.sha256, hash(fixture));
+  assert.equal(result.sha256, hash(canonical));
 });
 
 test('malformed and empty sources are skipped before the next valid source', async () => {
@@ -91,7 +93,7 @@ test('a response reported as redirected is rejected even when status is 200', as
   Object.defineProperty(redirected, 'redirected', {value: true});
   const result = await resolveKeys(emptyRelease, async url => url === urls[0] ? redirected : response(secondFixture));
   assert.equal(result.source.url, urls[1]);
-  assert.equal(result.sha256, hash(secondFixture));
+  assert.equal(result.sha256, hash(secondFixture.trim().split(/\s+/).slice(0, 2).join(' ') + '\n'));
 });
 
 test('fetch timeout is bounded even when an upstream ignores AbortSignal', async () => {
@@ -139,7 +141,7 @@ test('streamed size is enforced even without or with a misleading Content-Length
 });
 
 test('oversized declared length is rejected without reading the body', async () => {
-  const error = await unavailable(async () => new Response(fixture, {headers: {'Content-Length': String(KEY_SOURCE_LIMITS.maxBytes + 1)}}), {}, {...emptyRelease, fallbackSources: [urls[0]]});
+  const error = await unavailable(async () => new Response(fixture, {headers: {'Content-Length': String(SIGNED_BUNDLE_MAX_BYTES + 1)}}), {}, {...emptyRelease, fallbackSources: [urls[0]]});
   assert.equal(error.diagnostics[0].code, 'too-large');
 });
 
@@ -179,7 +181,7 @@ test('Unicode comments and CRLF are canonicalized, with a known SHA256 fingerpri
   assert.equal(key.fingerprint, 'SHA256:bbXpuKG6zhzdmnxq256TlqzFBzRl2f6OOg722cYNbU8');
   assert.equal(key.text, `${fixture.trim().split(/\s+/).slice(0, 2).join(' ')} 家用服务器 🔐 张三`);
   const bundle = await makeKeyBundle([key], revision, false);
-  assert.equal(bundle.sha256, hash(key.text + '\n'));
+  assert.equal(bundle.sha256, hash(canonical));
 });
 
 test('duplicates, options, certificates, private keys, invalid controls, and junk are rejected', async () => {
@@ -276,7 +278,7 @@ test('whole serialized protocol, including metadata, is limited to the client re
   assert.ok(Buffer.byteLength(bundle.text) <= KEY_SOURCE_LIMITS.maxBytes);
 });
 
-test('an upstream fitting the input cap but exceeding the serialized output cap is skipped', async () => {
+test('large upstream comments are stripped before publication without leaking labels', async () => {
   const publicBytes = keyData.subarray(keyData.length - 32);
   const lines = Array.from({length: 128}, (_, index) => {
     const bytes = Buffer.from(publicBytes); bytes[31] ^= index;
@@ -284,11 +286,13 @@ test('an upstream fitting the input cap but exceeding the serialized output cap 
     return prefix + 'x'.repeat(8190 - prefix.length) + '\n';
   }).join('');
   assert.ok(Buffer.byteLength(lines) <= KEY_SOURCE_LIMITS.maxBytes);
-  const error = await unavailable(async () => response(lines), {}, {...emptyRelease, fallbackSources: [urls[0]]});
-  assert.equal(error.diagnostics[0].code, 'too-large');
+  const output = await resolveKeys({...emptyRelease, fallbackSources: [urls[0]]}, async () => response(lines));
+  assert.equal(output.keyCount, 128);
+  assert.ok(output.keysText.length < 20000);
+  assert.equal(output.keys[0].label, 'Server key 1');
   const result = await resolveKeys(emptyRelease, async url => response(url === urls[0] ? lines : fixture));
-  assert.equal(result.source.url, urls[1]);
-  assert.equal(result.sha256, hash(fixture));
+  assert.equal(result.source.url, urls[0]);
+  assert.equal(result.keyCount, 128);
 });
 
 test('ordinary private-key advice in comments is allowed, while real private formats are rejected anywhere', async () => {
@@ -299,5 +303,171 @@ test('ordinary private-key advice in comments is allowed, while real private for
   for (const marker of ['-----BEGIN OPENSSH PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----', '-----BEGIN EC PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----', '-----BEGIN ENCRYPTED PRIVATE KEY-----', 'PuTTY-User-Key-File-3: ssh-ed25519']) {
     await assert.rejects(parsePublicKeys('# ' + marker + '\n' + fixture), /Private keys are never accepted/);
     await assert.rejects(parsePublicKeys(publicWithComment.trim() + ' ' + marker + '\n'), /Private keys are never accepted/);
+  }
+});
+
+const gistSource = {type:'gist',id:'a'.repeat(32),ownerId:12345,ownerLogin:'original-login',file:'ssh.keys',signatureFile:'ssh.keys.sig',bundleFile:'release.bundle'};
+const gistRevision = 'b'.repeat(40);
+const gistRelease = {...emptyRelease,keySource:gistSource};
+const signedPolicy = {listId:'production',sequence:9,issuedAt:100,expiresAt:300};
+const signedDocument = await makeSignedDocument(fixture,signedPolicy);
+// Syntactic fixture only, deliberately NOT a valid cryptographic signature. Worker never makes that claim.
+const signatureFixture = '-----BEGIN PGP SIGNATURE-----\n\nYWJj\n-----END PGP SIGNATURE-----\n';
+const signedBundleFixture = signedDocument + SIGNATURE_SEPARATOR + signatureFixture;
+const gistFile = (filename,content) => ({filename,content,size:Buffer.byteLength(content),truncated:false,encoding:'utf-8',raw_url:'https://untrusted.invalid/ignored'});
+const gistData = (files={}) => ({id:gistSource.id,owner:{id:gistSource.ownerId,login:'renamed-login'},public:true,truncated:false,history:[{version:gistRevision}],files});
+const jsonResponse = data => response(JSON.stringify(data));
+const gistUrl = `https://api.github.com/gists/${gistSource.id}`;
+
+for (const status of [201,204,206]) test(`non-200 success HTTP ${status} is not a key release`, async () => {
+  const result=await resolveKeys(emptyRelease,async url=>url===urls[0]?new Response(status===204?null:fixture,{status}):response(fixture));
+  assert.equal(result.source.url,urls[1]);
+});
+
+test('Git signed document is authoritative and exact, while missing/bad signature does not block OFF', async () => {
+  for (const signature of [null,'bad armor',signatureFixture]) {
+    const result=await resolveKeys({...emptyRelease,keys:fixtureKeys,signedDocument,signature},()=>assert.fail('No network'));
+    assert.equal(result.keysText,signedDocument); assert.equal(result.signedDocument,signedDocument);
+    assert.equal(result.signature,signature===signatureFixture?signatureFixture:null);
+    assert.equal(result.keyRevision,hash(signedDocument)); assert.equal(result.sha256,hash(canonical));
+    assert.equal(result.signedMetadata.sequence,9);
+  }
+});
+
+test('signed empty revocation suppresses fallback even when legacy allowEmpty is false', async () => {
+  const document=await makeSignedDocument('',{...signedPolicy,revoke:true});
+  const result=await resolveKeys({...emptyRelease,signedDocument:document,signature:signatureFixture},()=>assert.fail('Revocation must not fetch'));
+  assert.equal(result.keyCount,0);assert.equal(result.allowEmpty,true);assert.equal(result.source.type,'explicit-empty');
+  assert.equal(result.keysText,document);
+});
+
+test('strict sources never downgrade to raw keys; ordered signed fallback chooses one entire bundle', async () => {
+  const visited=[];
+  const result=await resolveKeys({...emptyRelease,keys:fixtureKeys},async url=>{visited.push(url);return response(url===urls[0]?fixture:signedBundleFixture);},{requireSigned:true,now:200});
+  assert.deepEqual(visited,urls.slice(0,2));assert.equal(result.source.url,urls[1]);assert.equal(result.signature,signatureFixture);
+  assert.equal(result.keysText,signedDocument);assert.equal(result.signedBundle,signedBundleFixture);
+});
+
+test('fallback standalone signed document gets only its same-source detached signature', async () => {
+  const visited=[];
+  const result=await resolveKeys(emptyRelease,async url=>{visited.push(url);return response(url.endsWith('.sig')?signatureFixture:signedDocument);},{requireSigned:true,now:200});
+  assert.deepEqual(visited,[urls[0],urls[0]+'.sig']);assert.equal(result.signature,signatureFixture);assert.equal(result.keysText,signedDocument);
+});
+
+test('missing, non200, malformed or hung optional signature still serves the valid OFF document', async () => {
+  for (const mode of ['missing','non200','bad','fetch-timeout','body-timeout']) {
+    let cancelled=false;
+    const body=new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('part'));},cancel(){cancelled=true;}});
+    const fetcher=async url=> {
+      if (!url.endsWith('.sig')) return response(signedDocument);
+      if(mode==='missing')return new Response('missing',{status:404});
+      if(mode==='non200')return new Response(signatureFixture,{status:206});
+      if(mode==='bad')return response('bad');
+      if(mode==='fetch-timeout')return new Promise(()=>{});
+      return new Response(body);
+    };
+    const result=await resolveKeys(emptyRelease,fetcher,{timeoutMs:20});
+    assert.equal(result.keysText,signedDocument,mode);assert.equal(result.signature,null,mode);
+    if(mode==='body-timeout')assert.equal(cancelled,true);
+  }
+});
+
+test('strict signature failure stays with its source before trying next whole signed release', async () => {
+  const result=await resolveKeys(emptyRelease,async url=>url===urls[0]?response(signedDocument):url===urls[0]+'.sig'?new Response('',{status:404}):response(signedBundleFixture),{requireSigned:true,now:200});
+  assert.equal(result.source.url,urls[1]);assert.equal(result.signedBundle,signedBundleFixture);
+});
+
+test('Gist fetch uses numeric-owner pin and immutable revision, never latest contents or raw_url', async () => {
+  const visited=[];
+  const result=await resolveKeys(gistRelease,async (url,init)=>{
+    visited.push(url);assert.equal(init.headers['User-Agent'],'conf-sshd-key-source');assert.equal(init.redirect,'manual');assert.equal(init.cache,'no-store');
+    if(url===gistUrl)return jsonResponse(gistData({'ssh.keys':gistFile('ssh.keys',secondFixture)}));
+    assert.equal(url,gistUrl+'/'+gistRevision);
+    return jsonResponse(gistData({'ssh.keys':gistFile('ssh.keys',fixture)}));
+  });
+  assert.deepEqual(visited,[gistUrl,gistUrl+'/'+gistRevision]);
+  assert.equal(result.sha256,hash(canonical));assert.equal(result.source.type,'gist');assert.equal(result.source.ownerId,12345);
+  assert.equal(result.source.ownerLogin,'original-login');assert.equal(result.source.gistRevision,gistRevision);
+  assert.equal(result.signature,null);
+});
+
+test('Gist signed document and signature are extracted from one pinned revision without transforms', async () => {
+  let calls=0;
+  const result=await resolveKeys(gistRelease,async url=>{calls++;return jsonResponse(gistData(url===gistUrl?{}:{'ssh.keys':gistFile('ssh.keys',signedDocument),'ssh.keys.sig':gistFile('ssh.keys.sig',signatureFixture)}));},{requireSigned:true,now:200});
+  assert.equal(calls,2);assert.equal(result.keysText,signedDocument);assert.equal(result.signature,signatureFixture);assert.equal(result.keyRevision,hash(signedDocument));
+});
+
+test('Gist bundle has one authoritative document and explicit revocation cannot be refilled', async () => {
+  const revoke=await makeSignedDocument('',{...signedPolicy,revoke:true});
+  const bundle=revoke+SIGNATURE_SEPARATOR+signatureFixture;
+  const result=await resolveKeys(gistRelease,async url=>{assert.ok(url.startsWith(gistUrl));return jsonResponse(gistData({'release.bundle':gistFile('release.bundle',bundle),'ssh.keys':gistFile('ssh.keys',fixture)}));});
+  assert.equal(result.keyCount,0);assert.equal(result.allowEmpty,true);assert.equal(result.keysText,revoke);assert.equal(result.source.file,'release.bundle');
+});
+
+test('missing/truncated/malformed Gist signature does not prevent an OFF document response', async () => {
+  for(const optional of [null,gistFile('ssh.keys.sig','bad'),{...gistFile('ssh.keys.sig',signatureFixture),truncated:true}]) {
+    const result=await resolveKeys(gistRelease,async()=>jsonResponse(gistData({'ssh.keys':gistFile('ssh.keys',signedDocument),...(optional?{'ssh.keys.sig':optional}:{})})));
+    assert.equal(result.keysText,signedDocument);assert.equal(result.signature,null);
+  }
+});
+
+for (const when of ['latest','revision']) test(`Gist owner mismatch in ${when} fails closed before ordered fallback`, async () => {
+  const visited=[];
+  const result=await resolveKeys(gistRelease,async url=>{
+    visited.push(url);
+    if(url===urls[0])return response(fixture);
+    const data=gistData({'ssh.keys':gistFile('ssh.keys',fixture)});
+    if((when==='latest')===(url===gistUrl))data.owner.id=99999;
+    return jsonResponse(data);
+  });
+  assert.equal(result.source.type,'fallback');assert.equal(visited.length,when==='latest'?2:3);
+});
+
+test('Gist rejects top-level truncation, private sources, invalid revision, selected-file truncation and byte mismatches', async () => {
+  const mutations=[data=>{data.truncated=true;},data=>{data.public=false;},data=>{data.history[0].version='../latest';},data=>{data.files['ssh.keys'].truncated=true;},data=>{data.files['ssh.keys'].size++;},data=>{data.files['ssh.keys'].filename='different';},data=>{data.files['ssh.keys'].encoding='base64';},data=>{data.id='b'.repeat(32);}];
+  for(const mutate of mutations){
+    const result=await resolveKeys(gistRelease,async url=>{if(url===urls[0])return response(fixture);const data=gistData({'ssh.keys':gistFile('ssh.keys',fixture)});mutate(data);return jsonResponse(data);});
+    assert.equal(result.source.type,'fallback');
+  }
+});
+
+test('Gist combined metadata/revision HTTP/body timeout is bounded and falls back without stale keys', async () => {
+  for(const mode of ['http','json','fetch','body']) {
+    let cancelled=false;
+    const body=new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('{'));},cancel(){cancelled=true;}});
+    const result=await resolveKeys(gistRelease,async url=>{
+      if(url===urls[0])return response(fixture);
+      if(url===gistUrl)return jsonResponse(gistData());
+      if(mode==='http')return new Response('',{status:503});
+      if(mode==='json')return response('{');
+      if(mode==='fetch')return new Promise(()=>{});
+      return new Response(body);
+    },{timeoutMs:20});
+    assert.equal(result.source.type,'fallback');if(mode==='body')assert.equal(cancelled,true);
+  }
+});
+
+test('Gist dynamic revision changes content digest while code revision stays fixed', async () => {
+  let current=gistRevision, text=fixture;
+  const fetcher=async url=>{const data=gistData({'ssh.keys':gistFile('ssh.keys',text)});data.history[0].version=current;assert.ok(url===gistUrl||url===gistUrl+'/'+current);return jsonResponse(data);};
+  const first=await resolveKeys(gistRelease,fetcher);
+  current='c'.repeat(40);text=secondFixture;
+  const second=await resolveKeys(gistRelease,fetcher);
+  assert.notEqual(first.sha256,second.sha256);assert.notEqual(first.source.gistRevision,second.source.gistRevision);assert.equal(first.revision,second.revision);
+});
+
+test('invalid Gist and signing config is rejected before any network request', async () => {
+  for(const keySource of [null,{type:'other'},{type:'git',url:'https://evil.example'}, {...gistSource,ownerId:'12345'}, {...gistSource,ownerId:0}, {...gistSource,id:'../escape'}, {...gistSource,ownerLogin:'bad/login'}, {...gistSource,file:'../key'}, {...gistSource,signatureFile:'ssh.keys'}, {...gistSource,token:'secret'}]) await assert.rejects(resolveKeys({...gistRelease,keySource},()=>assert.fail('Invalid config must not fetch')));
+});
+
+test('Gist response bytes are bounded and no fallback response inherits upstream text or private data', async () => {
+  const result=await resolveKeys(gistRelease,async url=>url===urls[0]?response(fixture):new Response('{}',{headers:{'Content-Length':String(2*SIGNED_BUNDLE_MAX_BYTES+1)}}));
+  assert.equal(result.source.type,'fallback');assert.doesNotMatch(JSON.stringify(result),/TEST-ONLY/);
+});
+
+test('named Gist bundles cannot silently downgrade to raw key files', async () => {
+  for(const contents of [fixture,signedDocument]) {
+    const result=await resolveKeys(gistRelease,async url=>url===urls[0]?response(fixture):jsonResponse(gistData({'release.bundle':gistFile('release.bundle',contents)})));
+    assert.equal(result.source.type,'fallback');
   }
 });

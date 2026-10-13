@@ -1,45 +1,49 @@
 # Quickly Configuring SSH Server
 
-在 Git 仓库中独立管理服务器 SSH 公钥，通过 Cloudflare Worker 发布，再由服务器定期同步。
+在 Git 仓库或指定账号的 Gist 中独立管理服务器 SSH 公钥，通过同一个 Cloudflare Worker 发布网页、脚本、公钥清单、签名和公钥证书。
 
-- **优先使用本仓库的 `keys/authorized_keys`**；主清单为空时，可按配置顺序读取备用 HTTPS 公钥源。没有默认 GitHub 账号 SSH Keys 来源。
-- 网页、脚本与仓库公钥一起构建发布，不再依赖 GitHub Pages；备用公钥独立标记来源和内容摘要。
-- 首页支持浅色 / 深色 / 跟随系统、手机与宽屏，以及 GitHub 风格的代码块复制按钮。
-- POSIX Shell 客户端只替换自己的密钥管理区块，保留手工密钥；下载或校验失败保留上次成功的内容。
+- 不默认读取 GitHub 账号的 SSH 登录钥匙，不依赖独立 GitHub Pages 部署。
+- 普通模式仅校验公钥格式；可选高信任模式由**服务器脚本**验证 GPG 签名，Worker 无法远程关闭它。
+- 脚本落盘后固定，定时任务只同步公钥。升级、修改信任指纹或关闭验签需要显式重新安装。
+- 首页有浅色 / 深色 / 系统主题、响应式布局和逐条命令复制；不显示或内嵌公钥正文、指纹、个人注释。
 
-> 仓库初始没有服务器公钥，生产构建会拒绝空清单。先填写你独立管理的服务器**公钥**或显式配置备用源；不要上传私钥，也不要直接拿测试夹具上线。
+> 初始生产清单和备用源为空，没有配置实际签名证书或发布凭据。生产构建不会偷偷使用测试密钥。仓库中的公钥文件不是 GitHub 账号登录凭据。
 
-## Quick Usage
+## 使用与重新安装
 
-以下地址是部署配置中的示例。Fork 后先修改 `deployment.json`，填写公钥并完成自己的 Worker 部署，再使用自己的域名。执行前建议下载并检查脚本。
+先配置并部署自己的 Worker，再使用自己的域名。以下地址只是本项目的部署配置示例。
 
-安装公钥并设置定时同步：
+普通 HTTPS 安装 / 显式重新安装并启用定时同步：
 
 ```sh
-curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- -c
+curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- --install --download-script -c
 ```
 
-新安装默认每 15 分钟同步一次；已有的有效自定义计划会保留。只更新一次：
+再次执行安装命令会检测已安装脚本，备份并升级。签名策略只在已替换旧客户端之后激活；若后续磁盘写入失败，可能留下新脚本和未完成的配置，请按错误信息检查并显式重新安装，不要把失败当作策略已启用。已有本地配置和自定义定时计划默认保留，不因远端仓库默认值变化而重置。新安装默认每 15 分钟同步。
+
+**这条命令信任下载到的可执行脚本。** HTTPS、同一 Worker 提供的摘要和后续公钥验签，不能证明首次安装器本身可信。高信任安装应先取得独立渠道核对过的脚本摘要和完整 GPG 指纹，下载、核验本地文件后执行安装。不要把从同一被攻陷来源获得的指纹当作独立信任依据。
+
+日常同步、预览、状态使用已经落盘的脚本：
 
 ```sh
-curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- -o
+sh "$HOME/.conf-sshd/conf-sshd.sh" -o
 ```
 
-预览、帮助与本地状态：
-
 ```sh
-curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- -o --dry-run
-```
-
-```sh
-curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- -h
+sh "$HOME/.conf-sshd/conf-sshd.sh" -o --dry-run
 ```
 
 ```sh
 sh "$HOME/.conf-sshd/conf-sshd.sh" --status
 ```
 
-指定计划、取消计划、单独更新已安装脚本：
+查看完整参数，不修改配置：
+
+```sh
+curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- -h
+```
+
+指定 / 取消自己的定时计划：
 
 ```sh
 sh "$HOME/.conf-sshd/conf-sshd.sh" -c '0 */6 * * *'
@@ -50,72 +54,117 @@ sh "$HOME/.conf-sshd/conf-sshd.sh" -c false
 ```
 
 ```sh
-sh "$HOME/.conf-sshd/conf-sshd.sh" -u
-```
-
-卸载定时同步与脚本，保留密钥及 SSH 服务配置：
-
-```sh
 sh "$HOME/.conf-sshd/conf-sshd.sh" --uninstall
 ```
 
-这些命令用途不同，按需单独执行。网页只提供逐块复制，不把安装、卸载、密码策略合成“执行全部”。
+卸载保留授权密钥、SSH 服务配置、本地信任配置与防回滚状态。`-u` 不再下载或替换脚本，会提示显式重新安装。没有自动更新周期；延长更新周期本身也不是安全验证。
 
-## 公钥清单与发布
+## Git / Gist 管理模式
 
-将普通 OpenSSH 公钥逐行放入 `keys/authorized_keys`，可附注释和空行。构建会规范化换行与编码，逐条调用 `ssh-keygen` 校验，拒绝重复钥匙、私钥、无效编码和未知行。
+### Git
 
-支持 ED25519、RSA（至少 2048 位）、ECDSA nistp256/384/521 和 OpenSSH 安全密钥类型。第一版不接受 DSA、证书或 `command=`、`environment=` 等 authorized_keys 选项。私钥应始终保留在你的客户端或安全密钥设备上。
+`keySource.type` 为 `git`（默认）。普通公钥逐行放入 `keys/authorized_keys`；构建校验并去掉所有注释，再发布。若注释曾提交公开仓库，它仍可能存在于历史中，因此发布前也应从源文件去掉个人信息。
 
-配置文件 `deployment.json`：
+支持 ED25519、RSA（2048–16384 位）、ECDSA nistp256/384/521 和 OpenSSH 安全密钥格式。不接受 DSA、SSH 证书、`command=` 等 authorized_keys 选项、重复公钥或私钥。
 
-- `baseUrl`：Worker 的正式 HTTPS origin，不带路径或末尾斜杠。
-- `repositoryUrl`：自己的项目仓库地址。
-- `defaultCron`：新安装的默认同步计划，默认 `*/15 * * * *`。
-- `allowEmpty`：默认 `false`；明确设为 `true` 时，空主清单表示撤销全部，禁止回退到备用源。
-- `fallbackSources`：默认空数组。可填写最多 5 个公开 HTTPS URL，按顺序尝试；不能带凭据、查询参数或片段，不接受请求端传入的地址。
+签名发布使用精确签名文档和 detached ASCII-armored GPG 签名。两者与网页、脚本一同构建，作为同一 Worker 发布产物交付；不会在发布后重新生成签名正文。
 
-页面展示的是**当前已发布版本**，不是每台服务器的实时同步状态。提交合并后还要等待部署成功；服务器会在下一次成功同步时应用。
+在持有签名私钥的可信电脑上，先生成新的文档（序号必须递增，时间自行选择）：
 
-### 有序备用源
+```sh
+node scripts/prepare-key-release.mjs --input keys/authorized_keys --output keys/ssh.keys --list-id my-servers --sequence 1 --issued-at 1791856800 --expires-at 1794448800
+```
 
-只有仓库清单为空，且 `allowEmpty` 不是 `true` 时，Worker 才依次读取 `fallbackSources`。取第一个成功且有效的非空公钥集合，不聚合多个源。仓库清单非空始终优先；明确撤销全部时不调用任何备用源。
+上例时间仅展示参数格式，不应照抄为正式有效期。工具会拒绝覆盖已有文件；更新时先保留旧版并明确选择新输出，再审阅替换。清空发布必须使用空输入并加 `--revoke`。
 
-每个备用源有 3 秒超时（含正文读取）、1 MiB 正文限制、最多 1000 个公钥，并拒绝重定向。非 2xx、空正文、无效 UTF-8、私钥/选项/证书、损坏密钥或重复密钥会跳过并尝试下一个。全部失败时 `/ssh.keys` 和 `/release.json` 返回 503，首页说明暂不可用；客户端保留上次成功的密钥。
+审核精确文档后，使用你自己的授权签名钥匙手动签名：
 
-不设置 Worker 备用公钥缓存，不使用陈旧内容兜底；每个相关请求重新获取，要求上游也正确提供当前数据。首页的一次响应中，公钥、复制内容、来源、数量与内容摘要来自同一个结果。不同时间请求可能看到备用源的不同版本，因此页面分别显示代码修订与公钥摘要，不能只用 Git 提交号代表动态公钥版本。
+```sh
+gpg --armor --detach-sign --local-user FULL_PRIMARY_FINGERPRINT --output keys/ssh.keys.sig keys/ssh.keys
+```
 
-撤销备用源公钥取决于上游更新、下一次成功请求和服务器同步周期；这不是即时断开连接的机制。主清单为空、未允许明确撤销且未配置备用源时，生产构建仍会拒绝。
+`FULL_PRIMARY_FINGERPRINT` 必须替换为独立核对的完整指纹；GPG 可选择该主钥的签名子钥。不要上传私钥，也不要在 Actions 中自动运行签名步骤。上传的 `ssh.keys` 与 `ssh.keys.sig` 必须保持原始字节；Gist 使用同样文件即可。Git 也可使用工具打包的 `keys/release.bundle`，但不能与 `keys/ssh.keys` 同时存在。
 
-### 明确撤销全部管理密钥
 
-确实需要删除全部受管理密钥时，在同一提交中清空公钥清单，并显式将 `allowEmpty` 改为 `true`。发布与新客户端都会检查数量、版本和内容摘要，只有合法的明确空清单才会清空管理区块。
+### Gist
 
-先确认其他恢复登录方式可用。手工放在管理区块之外的密钥不会删除；同一把钥匙若还存在于其他 authorized_keys 来源，仍可能允许登录。删除密钥也不会终止已有 SSH 会话。
+配置固定的 Gist ID、账号数字 `ownerId`、显示用 `ownerLogin` 和文件名。Worker 通过 GitHub REST API 核对所属账号，取得当前修订后，再从那个固定修订读取公钥与签名。不能仅靠 URL 中的用户名判断所属，也不能从任意请求参数传入 Gist/上游地址。
 
-网络故障、错误正文、未知协议或校验失败都会保留本地旧密钥并报错。因此断网时不能保证及时撤权。旧版本客户端不支持明确空清单撤权，应先升级。
+公开 Gist 无需读取 token；仅使用明确配置的文件，不跟随 API 返回的任意 raw URL。缺失文件、截断响应、owner 不匹配、超时或非 200 均视为来源失败。
 
-### 安全边界
+同一 Gist 同时含 `release.bundle` 与拆分文件时，bundle 优先；切换到拆分文件前应明确移除旧 bundle，避免持续发布旧内容。`ownerLogin` 只是显示信息，数字 owner ID 才是身份固定值。
 
-服务器密钥与 GitHub 账号认证密钥相互独立。在仓库里保存公钥不会把它注册为 GitHub 账号登录凭据。
+更新签名文档后必须重新签名。Worker 不持有签名私钥，不会为 Gist 的任意修改自动背书。普通模式可以发布无签名清单；客户端是否验签由其本地策略决定。
 
-但能修改并发布这个项目的人，以及被配置为备用公钥源的发布者，都能改变使用它的服务器的授权密钥。请保护仓库主分支、CI、Cloudflare 账号和部署权限。HTTPS 保护传输，SHA-256 用于检测截断或版本不一致，**不能抵抗发布源本身被攻陷**。`curl | sh` 仍意味着信任发布的可执行脚本；定时任务只拉公钥，不会自动更新脚本。
+Gist 配置示例（将 ID 与账号数字 ID 替换为经过核对的真实值）：
 
-## 安装与部署
+```json
+{"keySource":{"type":"gist","id":"0123456789abcdef0123456789abcdef","ownerId":123456,"ownerLogin":"example","file":"ssh.keys","signatureFile":"ssh.keys.sig","bundleFile":"release.bundle"}}
+```
 
-### 前提
+### 可见性
 
-构建环境需要 Node.js 22+、npm、Git、OpenSSH 客户端工具（`ssh-keygen`）及 POSIX `sh`。依赖固定在 `package-lock.json`。
+网页不嵌入密钥，不代表数据保密。`/ssh.keys` 可公开读取，公开 Git/Gist 和历史也可访问；去掉注释后，相同公钥字节仍能被关联。私钥始终留在使用者或可信签名端，不能上传本项目、Worker、Actions 或 Gist。
 
-客户端需要 `sh`、`curl`、`ssh-keygen`、`awk`、`mktemp`、`stat` 和常用 Unix 工具，以及 `sha256sum` / `shasum` / `openssl` 之一；设置定时同步还需 `crontab`。请自行安装所需软件。脚本不安装包、不启动或重载服务；`-n` 保留为兼容参数。
+## 客户端 GPG 验证（默认 OFF）
 
-目标为 Linux 上的 dash、Bash 的 sh 用法和 BusyBox ash。真实发行版服务管理、SELinux 标签或自定义 `AuthorizedKeysFile` 不应仅凭单元测试视为已验证。默认目标文件是当前用户的 `$HOME/.ssh/authorized_keys`；自定义 SSH 授权路径需要人工核对。
+- **OFF**：只下载 `/ssh.keys`，校验协议、公钥格式和明确空清单；不请求 `/ssh.keys.sig` 或 `/public-key.gpg`，即使它们存在也不验签。
+- **ON**：取得 `/ssh.keys` 原始字节和同源 `/ssh.keys.sig`，用安装时固定的专用本地钥匙环验证。HTTP 下载每次都必须是 200；404、其他状态、重定向、下载失败、证书指纹不符或验签失败均拒绝该更新。绝不自动回退为 OFF。
+- 验签覆盖完整响应，包括元数据、换行和公钥正文。不能先去注释、重新排序或转换编码再验签。
+- 本地记录完整 40 位 OpenPGP v4 指纹，不接受短 key ID。`primary` 模式接受该主密钥及经 GPG 验证绑定的有效签名子钥；`subkey` 只接受指定签名子钥，不接受同主钥的其他子钥。主钥下后来新增的签名子钥仍需通过显式重新安装更新本地证书；固定指纹不会自动下载最新子钥集合。
+- 日常验证使用隔离的专用本地 GPG keyring，不信任用户默认钥匙环，也不自动访问 keyserver；网络返回的其他钥匙不能扩大本地授权。
 
-### 一次性配置
+仓库可设置新安装默认值，安装时可显式覆盖。**已安装机器的本地配置优先**，之后改仓库默认值不能关闭它的验证。开启验证、换指纹/信任范围或关闭已有验证都必须显示具体信息并取得本地明确确认；取消或无法确认时不应用修改。
 
-1. Fork / 克隆仓库，填入自己的服务器公钥和 `deployment.json`。
-2. 按需要修改 `cf-worker/wrangler.toml` 中的 Worker 名称，并为 `baseUrl` 配置 Worker 自定义域名。无需启用 GitHub Pages。
-3. 安装依赖、运行检查、构建生产产物：
+安装在本地明确确认后依序寻找对应证书：已有本地证书、Worker `/public-key.gpg`、可选 Email 的 WKD、配置的有序 keyserver。每一步仍必须匹配完整指纹；没有 Email 时跳过 WKD；内置有序服务器为 `hkps://keys.openpgp.org`、`hkps://keyserver.ubuntu.com`，允许显式覆盖。它们只是证书分发源，不是信任根；缺少 UID、无法导入或不支持指定子钥查询时继续下一源，绝不缩短指纹。全部失败则保留现有配置并停止。通过验证的公共证书保存到专用本地钥匙环。仓库默认 Email 会写入公开安装脚本，只应填写愿意公开的邮箱；它只是发现提示，不能取代指纹。
+
+公钥证书可公开分发，信任来自独立核对并固定的完整指纹。证书内容即使具有相同主指纹，也未必是最新撤销状态：恶意分发端可能重放旧证书、隐瞒新撤销。客户端检查收到的证书中已有的过期/撤销信息，但不能保证及时获知被隐瞒的撤销。复用本地证书也不会自动获知之后的撤销。重新安装仍优先使用有效的本地证书；若需更新同指纹证书，显式提供从可信渠道取得的新公共证书，再核对其撤销/子钥状态。
+
+完整指纹和 Email 可在 `clientDefaults` 设置，也可显式安装覆盖。例如先独立核验已下载的本地脚本，再执行：
+
+```sh
+sh ./conf-sshd.sh --install -c --gpg-verification on --gpg-fingerprint FULL40HEX --gpg-pin-mode primary --list-id my-servers --gpg-email signer@example.com
+```
+
+占位指纹必须替换为真实完整指纹；Email 可省略。安装会在本地终端要求输入展示的完整指纹确认，没有静默确认参数。关闭已有验证使用显式重新安装加 `--gpg-verification off`，同样需要终端确认。重新安装可用 `--fallback-urls-file` 指定按行排列的备用文档 URL；`--keyserver` 可重复覆盖内置列表，原有设置默认保留。
+
+### 签名文档、防回滚与故障
+
+列表 ID 使用 1–64 个字母、数字、点、下划线或连字符，单独的 `-` 保留给本地未配置状态，不能作为列表名。
+
+签名文档使用固定 LF 格式：协议标记、列表 ID、单调递增序号、签发/到期 Unix 秒、明确撤销标志、数量、结束标记，以及无注释的规范公钥正文。签名覆盖精确全部字节。
+
+ON 客户端检查固定列表 ID、有效期和持久化的最高序号/摘要。低序号拒绝；同序号只接受同一文档；明确撤销也必须签名并增加序号。首次安装的最低序号应通过可信渠道确定，否则仅有指纹不能排除有效期内的旧发布。
+
+更新使用锁、待提交记录、快照检查和原子替换来处理进程中断。待提交发布已过期时不会强行应用，保留其序号下限后允许有效的新发布继续；损坏且无法可信恢复的状态会停止并提示人工检查。不要删除或恢复旧版本的本地防回滚状态；整机快照回滚、本地管理员篡改或底层文件系统掉电持久性不由一个 POSIX 脚本保证。
+
+下载/验签失败或清单过期会保留最后成功的密钥并报错，**不会自动清空密钥造成锁死**。攻击者仍可阻断更新；离线机器无法保证及时撤权。删除公钥不会终止已有会话，也不会移除管理区块外的手工重复钥匙。部署签名私钥或服务器本地管理员权限失陷超出这层保护范围。
+
+## 有序备用源
+
+有两份有意区分的配置：
+
+1. Worker 部署的 `fallbackSources`：主来源不可用或普通主清单为空时，按顺序取首个有效集合，不合并多个来源。明确撤销阻止回退。
+2. 每台服务器本地保存的备用 URL：主 Worker 更新失败时，按本地顺序尝试，最多一个主源加五个备用源。每个端点单次请求最多 30 秒；由后续源或下次计划同步重试。只通过显式安装配置改变，远端响应不能覆盖。
+
+服务器本地备用 URL 必须返回本项目 v1 或 signed-v1 文档；普通原始公钥文件可通过 Worker 来源适配器发布。客户端 ON 时，备用 URL 和对应 `.sig` 必须满足相同指纹、列表 ID、签名、时效和防回滚策略。不能用另一来源的签名拼接，更不能在失败后接受未签名公钥。Worker 不能替未签名备用源伪造可信签名。
+
+Worker 上游请求有时间、流式字节数、数量限制，并拒绝重定向。没有 Worker 陈旧公钥缓存，每个相关请求重新读取；API 响应 `Cache-Control: no-store`。Gist 的正文与签名取自同一修订。客户端两次 HTTP 请求之间若恰逢新发布，签名不匹配会安全拒绝，后续同步再重试。
+
+## 配置与部署
+
+`deployment.json`：
+
+- `baseUrl`：正式 HTTPS origin，无路径、凭据或末尾斜杠。
+- `repositoryUrl`：项目 GitHub 地址。
+- `defaultCron`：新安装默认计划。
+- `allowEmpty`：普通 Git 模式明确允许撤销全部管理密钥；默认 false。
+- `fallbackSources`：最多五个公开 HTTPS URL，不含凭据、query、fragment 或本地/IP 地址。
+- `keySource`：Git 或固定账号 Gist 配置。
+- `signedRelease`：签名列表身份和可公开发布的证书配置；不是私钥。
+- `clientDefaults`：首次安装的验签默认值、完整指纹、primary/subkey 范围、列表 ID 和可选公开 Email；不覆盖现有本地设置。
+
+构建需要 Node.js 22+、npm、Git、OpenSSH 客户端和 POSIX sh；GPG 验证/测试需要 `gpg`。服务器需要 curl、ssh-keygen、awk、mktemp、stat、常用 POSIX 工具及 sha256sum/shasum/openssl 之一，ON 还需要 gpg；计划任务需要 crontab。脚本不会自动安装软件。
 
 ```sh
 npm ci
@@ -124,72 +173,61 @@ npm run build
 node scripts/verify-release.mjs
 ```
 
-4. 在 GitHub 的生产环境中配置最小权限的 Cloudflare 部署 token 和账号 ID，对应 `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`。凭据只存放在 Secrets，不能提交到代码或公钥清单。
-5. 准备好正式公钥、域名和权限后，将仓库变量 `ENABLE_WORKER_DEPLOY` 设为 `true`。此后 main 的更新会运行生产发布流程，也可手动触发。
+正式上线前配置自己的域名、Worker 名称、正式公钥/签名和最小权限 Cloudflare Secrets。将仓库 `ENABLE_WORKER_DEPLOY=true` 才启用 main 发布；默认关闭。PR 测试不部署。
 
-默认关闭自动生产发布，防止合并本次改动时意外上线。PR 验证不会读取部署凭据或发布 Worker。
+### 可选 Git 提交签名门禁
 
-生产流程先测试和严格构建，再部署，最后核对 `/release.json` 和 `/ssh.keys` 的版本与摘要。没有正式密钥、没有备用源且未显式允许空清单时会失败；不会偷偷改用 GitHub Keys 或测试密钥。
+`REQUIRE_GPG_SIGNATURE=true` 时，发布验证任务先验证本次精确 `GITHUB_SHA`，然后才执行依赖安装、测试和构建。授权完整主指纹和公钥从 GitHub 设置中的 `GPG_ALLOWED_PRIMARY_FINGERPRINTS`、`GPG_PUBLIC_KEYS` 读取，而不是让待部署提交自行指定。
 
-发布脚本、网页、仓库公钥和备用源配置属于同一构建产物；动态备用公钥有单独的内容摘要。若要回滚历史版本，先查看公钥差异：回滚可能重新启用已撤销的密钥。部署失败保留旧发布，但不能把这描述为新密钥已生效。
+GitHub 的通用 Verified 标记不是本项目授权名单。最终 merge/squash 提交必须由授权 GPG 钥匙签署；仅 PR 内旧提交签名不够。手动发布也不能绕过同一验证。
 
-## Paths
+**这是附加门禁，不能替代服务器验签。** 同仓库 workflow/验证器可被有权限者修改，需配合主分支与工作流强制审阅、受保护 production 环境和最小权限凭据。能修改验证工作流并访问发布凭据的人仍在信任边界内。
+
+### 可选部署邮件通知 hook
+
+默认关闭。通过 `ENABLE_MAIL_NOTIFICATION`、`MAIL_NOTIFICATION_WEBHOOK` 和可选 `MAIL_NOTIFICATION_TO` 接入你控制的邮件提供方 webhook；本项目不内置 SMTP 服务，也不会自行创建凭据。
+
+通知说明部署结果、代码 SHA、来源模式、列表身份和**部署配置中的**备用 URL。它不是服务器清单，不知道各机器后来修改的本地备用源，也不是每次 Gist 内容变更的监视器。通知失败或被压制不能当作部署未发生/系统安全的证明。
+
+## API
 
 | 路径 | 内容 |
 | --- | --- |
-| `/` | 浏览器首页；旧 curl/libcurl 请求仍返回脚本（显式请求 HTML 除外） |
-| `/script.sh` | Shell 脚本，推荐所有新命令使用这个明确地址 |
-| `/ssh.keys` | 带注释元数据的普通公钥文本 |
-| `/release.json` | 当前代码版本、有效公钥来源、数量、摘要和空清单状态 |
+| `/` | 浏览器首页；curl/libcurl/wget/HTTPie 返回脚本，显式 HTML 优先 |
+| `/script.sh` | 安装脚本 |
+| `/ssh.keys` | 精确公钥文档；签名存在时就是被签名的原始字节 |
+| `/ssh.keys.sig` | 对上述文档的 detached GPG 签名；没有可用签名时 404 |
+| `/public-key.gpg` | 配置的公共 GPG 证书；未配置时 404 |
+| `/release.json` | 来源、数量、摘要、代码修订及签名是否提供；不表示服务器已验签 |
 
-动态入口不缓存旧数据；带内容哈希的静态 CSS / JS 可以长期缓存。未知路径返回 404，不能用首页 HTML 代替密钥或脚本错误。
+脚本、Git 公钥/签名与网站一起构建发布；不需要额外 Pages。动态 Gist/备用数据的序号和摘要与代码修订分别表示。静态 CSS/JS 使用内容哈希缓存，未知接口返回 404，不返回 HTML 冒充密钥。
 
-## 客户端保护措施
+## 从旧版迁移
 
-- 所有参数先解析；未知选项、缺参数或冲突用途会报错。
-- 下载具有 HTTPS 限制、HTTP 失败检测、超时、有限重试和大小限制。
-- 响应包含协议版本、Git revision、密钥数量、明确空清单标记和 SHA-256；所有公钥逐条校验。
-- 每个用户独占运行锁；临时文件使用不可预测名称、严格权限和异常清理。
-- 只识别唯一且配对的原有 BEGIN / END 管理标记，损坏或重复时停止，避免误吞手工密钥。
-- 同目录原子替换，写入前保存一个受限备份；重复执行内容相同时不重写文件。
-- 拒绝符号链接、不合适的所有权/写权限和异常文件类型。
-- `-c` 只管理自己的 cron 区块；原版已知命令可迁移，无法可靠判断的记录会停止并提示。
-- 正常密钥同步不会修改 `sshd_config`，也不会重载 SSH 服务。
+1. 保留恢复会话和备用登录方式，先核对独立服务器清单。
+2. 显式重新安装新版脚本，检查本地配置、自定义计划、管理区块和手工钥匙。
+3. 逐台核对脚本版本、完整指纹、验证模式、列表 ID 和序号；等待一段时间不是所有服务器升级完成的证据。
+4. 再切换新的签名文档格式并按确认流程启用 ON。新版 OFF 可以解析新文档但不验签；旧 v1 客户端会拒绝新格式并保留旧钥匙，不能把它视为已得到保护。
+5. 另开 SSH 会话验证登录。回滚旧 Worker 可能重新发布历史钥匙；ON 客户端有序号防回滚，但不要依赖普通模式抵抗历史重放。
 
-如果运行被不可捕获地终止，锁可能残留。先检查 `.conf-sshd/lock/pid` 对应的进程及工作状态，再人工处理锁，不能仅凭锁的年龄删除。
+## 客户端操作边界
 
-### Root 密码登录（高级）
+仅操作当前用户 `$HOME/.ssh/authorized_keys` 的唯一配对管理区块。临时文件、锁、备份、同目录替换和写前快照检查避免可观察到的并发覆盖；不同编辑器不共享锁时仍无操作系统级原子比较交换保证。
 
-保留 `-p yes` / `-p no`，必须单独显式使用并以 root 运行。不属于安装/同步默认流程。它只设置 `PermitRootLogin`，不会替你打开其他认证策略。
+`-p yes/no` 是独立 root 高级操作，仅修改 PermitRootLogin，验证 `sshd -t/-T` 后替换，遇 Include/Match 等复杂配置拒绝；不会自动 reload/restart。普通安装/同步不修改 SSH 服务策略。
 
-脚本会检查原配置、生成临时配置、验证语法与生效值、备份后替换，**不会自动 reload/restart**。发现 Include / Match 等无法安全判断的组合时，会拒绝修改并请你人工处理。应用服务变更前应保留恢复会话并测试新连接。
+目标为 Linux dash、Bash POSIX 与 BusyBox ash。测试不等于真实服务器登录、SELinux、发行版服务管理或自定义 AuthorizedKeysFile 已验证。异常强制终止可能留下锁，人工确认原进程状态后再处理。
 
-## 从旧版本迁移
-
-1. 先建立独立服务器公钥清单并发布新 Worker；或显式配置备用源；不会自动导入 GitHub 账号公钥。
-2. 检查页面公钥、版本和 `/ssh.keys`，确认是你的服务器密钥。
-3. 显式更新已安装脚本，或从新的 `/script.sh` 下载并检查后重新运行 `-c`。
-4. 验证自定义 cron 仍保留，手工密钥不变，另开 SSH 会话验证登录。
-
-旧客户端对非空的 `/ssh.keys` 仍有基本格式兼容，但不具备新验证、明确空清单撤权与其他保护。不要因为 Worker 更新了就认为所有客户端已升级。
-
-## 开发与测试
+## 测试
 
 ```sh
-npm ci
 npm test
 npm run build:test
 npx wrangler deploy --dry-run --config cf-worker/wrangler.toml
 ```
 
-`build:test` 只用于测试/预览，使用公开的 RFC 测试公钥，并在产物中标记 `testFixture: true`。生产验证脚本拒绝该产物；生产构建只使用仓库公钥和显式配置的备用源，不允许回退到测试夹具。
-
-测试覆盖构建配置与注入边界、逐条密钥验证、Worker 路由/缓存、主题/复制交互、Shell 参数/管理区块/失败保留/cron/自更新等。Shell 测试只在临时 HOME、假命令和测试文件中运行，不操作真实 SSH 配置或服务。
-
-`npm run build:test` 之后若要部署正式版本，必须重新执行 `npm run build` 与 `node scripts/verify-release.mjs`。不得直接部署测试产物。
+测试只使用临时 HOME、命令替身、公开测试 SSH 钥匙及临时无身份/无访问权限的 GPG 测试钥匙。真实浏览器测试仅访问 localhost。`build:test` 产物标记为测试，生产验证拒绝它；上线必须重新生产构建。
 
 ## License
 
 Apache-2.0，见 [LICENSE](LICENSE)。
-
-客户端会检测写入期间可观察到的手工修改并停止；其他编辑器若不遵守同一锁，仍无法保证操作系统级的原子比较并交换。请避免同时手工编辑授权文件。

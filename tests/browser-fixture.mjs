@@ -12,7 +12,7 @@ export async function startBrowserFixture() {
     readFile(new URL("./fixtures/keys.pub", import.meta.url), "utf8"),
   ]);
   const [type, encoded] = fixtureKey.trim().split(/\s+/);
-  const comment = 'CI test <img src=x onerror="window.__injected=true"> & "quoted" 中文 ' + "long-comment-".repeat(90);
+  const comment = 'HOMEPAGE-MUST-NOT-LEAK-COMMENT CI test <img src=x onerror="window.__injected=true"> & "quoted" 中文 ' + "long-comment-".repeat(90);
   const text = `${type} ${encoded} ${comment}`;
   const key = {
     type,
@@ -32,13 +32,15 @@ export async function startBrowserFixture() {
     ...config,
     commands: commandsFor(config),
     keys: [key],
+    signedMetadata: null,
   };
   const snapshots = {
-    repository: { ...base, source: { type: "repository" } },
+    repository: { ...base, publicCertificate: "HOMEPAGE-MUST-NOT-LEAK-CERTIFICATE", source: { type: "repository" } },
+    gist: { ...base, keyRevision: "d".repeat(64), signedMetadata: {listId: "fixture-signing-list", sequence: 42, documentSha256: "d".repeat(64)}, keysText: text, signedDocument: text, signature: "-----BEGIN PGP SIGNATURE-----\nComment: HOMEPAGE-MUST-NOT-LEAK-SIGNATURE\n\nAQID\n-----END PGP SIGNATURE-----\n", signedBundle: text, source: {type: "gist", id: "f".repeat(32), gistRevision: "e".repeat(40), url: "https://gist.github.com/example/" + "f".repeat(32) + "/" + "e".repeat(40), extraPrivateComment: comment} },
     fallback: { ...base, source: { type: "fallback", url: "https://keys.example.test/team.keys?comment=<script>window.__injected=true</script>" } },
     unavailable: { ...base, keys: [], keyCount: 0, sha256: null, source: { type: "unavailable" } },
     pending: { ...base, keys: [], keyCount: 0, sha256: null, source: { type: "pending" } },
-    "explicit-empty": { ...base, allowEmpty: true, keys: [], keyCount: 0, sha256: createHash("sha256").update("").digest("hex"), source: { type: "explicit-empty" } },
+    "explicit-empty": { ...base, allowEmpty: true, signedMetadata: {listId: "fixture-signing-list", sequence: 43, revoke: true}, keys: [], keyCount: 0, sha256: createHash("sha256").update("").digest("hex"), source: { type: "explicit-empty" } },
   };
   const pages = new Map(Object.entries(snapshots).map(([name, snapshot]) => ["/" + name, renderPage(template, snapshot)]));
   const requests = [];

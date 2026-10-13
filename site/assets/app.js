@@ -8,7 +8,6 @@
   const dialog = document.getElementById("copy-fallback");
   const fallbackText = document.getElementById("fallback-text");
   const closeFallback = document.getElementById("close-copy-fallback");
-  const allKeysButton = document.getElementById("copy-all-keys");
   const validThemes = new Set(["system", "light", "dark"]);
   const resetTimers = new WeakMap();
   let fallbackTrigger = null;
@@ -114,24 +113,6 @@
     }
     button.addEventListener("click", () => copy(target.textContent, button));
   });
-
-  let keys = [];
-  try {
-    const release = JSON.parse(document.getElementById("release-data")?.textContent || "{}");
-    if (Array.isArray(release.keys) && release.keys.every((key) => typeof key.text === "string" && key.text.length > 0)) {
-      keys = release.keys.map((key) => key.text);
-    }
-  } catch {
-    // Prerendered content remains usable if release metadata is unavailable.
-  }
-  if (keys.length === 0) {
-    keys = Array.from(document.querySelectorAll(".key-card pre code"), (code) => code.textContent).filter(Boolean);
-  }
-  if (allKeysButton) {
-    allKeysButton.disabled = keys.length === 0;
-    if (keys.length === 0) allKeysButton.setAttribute("title", "暂无可复制的公钥");
-    allKeysButton.addEventListener("click", () => copy(`${keys.join("\n")}\n`, allKeysButton));
-  }
 
   root.classList.add("enhanced");
 })();

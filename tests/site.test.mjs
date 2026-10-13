@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import { commandsFor, renderPage } from "../cf-worker/src/view.js";
+import { makeSignedDocument, parsePublishedSignedRelease } from "../cf-worker/src/signed-release.js";
 
 const script = await readFile(new URL("../site/assets/app.js", import.meta.url), "utf8");
 const html = await readFile(new URL("../site/index.html", import.meta.url), "utf8");
 const css = await readFile(new URL("../site/assets/style.css", import.meta.url), "utf8");
+const config = { baseUrl: "https://example.test", repositoryUrl: "https://github.com/example/repo", defaultCron: "*/15 * * * *" };
+const commands = commandsFor(config);
 
 class Element {
   constructor(id, text = "") {
@@ -32,12 +36,11 @@ class Element {
   close() { this.open = false; this.dispatch("close"); }
 }
 
-function setup({ keys = ["ssh-ed25519 AAAA exact comment"], savedTheme, brokenStorage = false, clipboard = async () => {}, rawRelease } = {}) {
+function setup({ commandTexts = commands.map(({command}) => command), savedTheme, brokenStorage = false, clipboard = async () => {}, missingTarget = false } = {}) {
   const root = new Element("root");
-  const ids = ["theme-picker", "copy-status", "copy-fallback", "fallback-text", "close-copy-fallback", "copy-all-keys", "release-data"];
+  const ids = ["theme-picker", "copy-status", "copy-fallback", "fallback-text", "close-copy-fallback"];
   const elements = new Map(ids.map((id) => [id, new Element(id)]));
-  const keyElements = keys.map((text, index) => new Element(`key-${index}`, text));
-  const codeElements = [...keyElements, new Element("command-install", "curl -fsSL https://example.test/script.sh | sh -s -- -c")];
+  const codeElements = commandTexts.map((text, index) => new Element(`command-${index}`, text));
   const pres = codeElements.map((code) => new Element(`pre-${code.id}`));
   const buttons = codeElements.map((code) => {
     const button = new Element(`copy-${code.id}`);
@@ -46,16 +49,12 @@ function setup({ keys = ["ssh-ed25519 AAAA exact comment"], savedTheme, brokenSt
     return button;
   });
   for (const element of codeElements) elements.set(element.id, element);
-  elements.get("release-data").textContent = rawRelease ?? JSON.stringify({ keys: keys.map((text) => ({ text })) });
-  elements.get("copy-all-keys").setAttribute("aria-label", "复制全部公钥");
+  if (missingTarget) elements.delete(codeElements[0].id);
+  const requestedIds = [];
   const document = {
     documentElement: root,
-    getElementById: (id) => elements.get(id) || null,
-    querySelectorAll: (selector) => ({
-      ".code-block pre": pres,
-      "[data-copy-target]": buttons,
-      ".key-card pre code": keyElements,
-    })[selector] || [],
+    getElementById: (id) => { requestedIds.push(id); return elements.get(id) || null; },
+    querySelectorAll: (selector) => ({ ".code-block pre": pres, "[data-copy-target]": buttons })[selector] || [],
   };
   const stored = new Map(savedTheme ? [["quickly-conf-sshd-theme", savedTheme]] : []);
   const timers = new Map();
@@ -71,15 +70,22 @@ function setup({ keys = ["ssh-ed25519 AAAA exact comment"], savedTheme, brokenSt
     clearTimeout: (id) => timers.delete(id),
   });
   vm.runInContext(script, context);
-  return { root, elements, keyElements, codeElements, buttons, pres, stored, flushTimers: () => {
+  return { root, elements, codeElements, buttons, pres, stored, requestedIds, flushTimers: () => {
     const pending = [...timers.values()];
     timers.clear();
     pending.forEach((callback) => callback());
   } };
 }
 
-test("homepage prerenders content, release metadata, and independent local assets", () => {
-  for (const token of ["RELEASE_JSON", "KEYS_HTML", "COMMANDS_HTML", "REVISION", "PUBLISHED_AT", "KEY_COUNT", "REPOSITORY_URL", "RELEASE_LABEL", "PREVIEW_NOTICE", "SOURCE_LABEL", "SOURCE_STATUS", "CONTENT_REVISION", "KEYS_NOTICE"]) {
+function snapshot(overrides = {}) {
+  return {revision: "a".repeat(40), publishedAt: "2026-10-12T00:00:00Z", keys: [], keyCount: 1, sha256: "b".repeat(64), keyRevision: "c".repeat(64), commands, ...config, ...overrides};
+}
+function embeddedMetadata(page) {
+  return JSON.parse(page.match(/<script id="release-data" type="application\/json">([\s\S]*?)<\/script>/)[1]);
+}
+
+test("homepage prerenders metadata and commands, never a public-key listing", () => {
+  for (const token of ["RELEASE_JSON", "COMMANDS_HTML", "REVISION", "PUBLISHED_AT", "KEY_COUNT", "REPOSITORY_URL", "RELEASE_LABEL", "PREVIEW_NOTICE", "SOURCE_LABEL", "SOURCE_STATUS", "SIGNATURE_STATUS", "CERTIFICATE_STATUS", "CERTIFICATE_LINK", "CONTENT_REVISION", "KEYS_NOTICE"]) {
     assert.ok(html.includes(`@@${token}@@`), `${token} placeholder is required`);
   }
   assert.match(html, /<html lang="zh-CN">/);
@@ -90,8 +96,124 @@ test("homepage prerenders content, release metadata, and independent local asset
   assert.match(html, /<noscript>/);
   assert.match(html, /不代表所有服务器均已同步/);
   assert.match(html, /不会要求上传或输入私钥/);
-  assert.doesNotMatch(html, /github\.io|https?:[^"']+\.(?:css|js)["']/);
-  assert.doesNotMatch(html, /copy-all-commands/);
+  assert.match(html, /公钥不是秘密/);
+  assert.match(html, /原始 API 与公开 Git \/ Gist/);
+  assert.doesNotMatch(html, /KEYS_HTML|key-list|key-card|copy-all|github\.io|https?:[^"']+\.(?:css|js)["']/);
+});
+
+test("homepage projection excludes raw keys, fingerprints, comments and signed document content", () => {
+  const secretMarker = "must-not-appear-in-homepage";
+  const key = {text: `ssh-ed25519 ${secretMarker} comment`, fingerprint: `SHA256:${secretMarker}`, label: `${secretMarker}<script>`, type: "ssh-ed25519"};
+  const page = renderPage(html, snapshot({keys: [key], keysText: key.text, signedDocument: key.text, signature: `-----BEGIN PGP SIGNATURE-----\nComment: ${secretMarker}\n\nAQID\n-----END PGP SIGNATURE-----\n`, publicCertificate: secretMarker, signedBundle: secretMarker, signedMetadata: {listId: secretMarker}, source: {type: "gist", url: "https://gist.github.com/example/example", keys: [key], fingerprint: key.fingerprint}}));
+  assert.doesNotMatch(page, new RegExp(secretMarker));
+  assert.doesNotMatch(page, /ssh-ed25519|SHA256:|data-copy-target="key-|id="key-\d|class="key-card"/);
+  const embedded = embeddedMetadata(page);
+  assert.deepEqual(Object.keys(embedded).sort(), ["schema", "revision", "publishedAt", "keyCount", "sha256", "keyRevision", "source", "sourceStatus", "signaturePresent", "signatureStatus", "certificatePresent", "certificateStatus", "repositoryUrl", "testFixture"].sort());
+  assert.deepEqual(embedded.source, {type: "gist", url: "https://gist.github.com/example/example"});
+  assert.equal(embedded.keyCount, 1);
+  assert.equal(embedded.keyRevision, "c".repeat(64));
+  assert.equal(embedded.signaturePresent, true);
+  assert.match(embedded.signatureStatus, /待客户端验证/);
+  assert.doesNotMatch(embedded.signatureStatus, /已验签|已验证签名|verified/i);
+  assert.match(page, /不代表 Worker 已验证签名/);
+});
+
+test("source states and signature presence describe one snapshot without claiming verification", () => {
+  for (const [type, status] of [["repository", "可用"], ["git", "可用"], ["gist", "可用"], ["fallback", "备用源可用"], ["unavailable", "暂不可用"], ["pending", "待获取"], ["explicit-empty", "明确撤销"]]) {
+    const unavailable = ["unavailable", "pending"].includes(type);
+    const empty = unavailable || type === "explicit-empty";
+    const state = snapshot({source: {type, url: 'https://example.test/list?text=<script>window.__injected=true</script>'}, keyCount: empty ? 0 : 1, allowEmpty: type === "explicit-empty", sha256: empty ? null : "b".repeat(64), keyRevision: empty ? null : "c".repeat(64)});
+    const page = renderPage(html, state);
+    const embedded = embeddedMetadata(page);
+    assert.equal(embedded.sourceStatus, status);
+    assert.equal(embedded.keyCount, empty ? 0 : 1);
+    assert.equal(embedded.signaturePresent, false);
+    assert.equal(embedded.signatureStatus, "未提供签名包");
+    assert.doesNotMatch(page, /<script>window\.__injected/);
+    if (unavailable) assert.match(page, /未发布撤销指令.*保留上次成功密钥/);
+    if (type === "explicit-empty") assert.match(page, /明确撤销全部受管理公钥/);
+  }
+  assert.equal(embeddedMetadata(renderPage(html, snapshot({signature: "unvalidated signature alone"}))).signaturePresent, false);
+  assert.match(renderPage(html, snapshot({source: {type: "gist"}, keyCount: 0, allowEmpty: true})), /class="source-status">明确撤销/);
+});
+
+test("a parsed valid document with missing or malformed signature stays unsigned on the homepage", async () => {
+  const fixture = await readFile(new URL("./fixtures/keys.pub", import.meta.url), "utf8");
+  const document = await makeSignedDocument(fixture, {listId: "homepage-regression", sequence: 1, issuedAt: 1, expiresAt: 2});
+  for (const signature of [null, "malformed-detached-signature"]) {
+    const parsed = await parsePublishedSignedRelease(document, signature, {checkFreshness: false});
+    assert.ok(parsed.metadata);
+    assert.equal(parsed.signature, null);
+    const page = renderPage(html, snapshot({keys: parsed.keys, keysText: parsed.document, signedDocument: parsed.document, signedMetadata: parsed.metadata, signature: parsed.signature, signedBundle: parsed.bundle}));
+    const metadata = embeddedMetadata(page);
+    assert.equal(metadata.signaturePresent, false);
+    assert.equal(metadata.signatureStatus, "未提供签名包");
+    assert.equal(metadata.certificatePresent, false);
+    assert.ok(!page.includes(parsed.keys[0].text));
+    assert.ok(!page.includes(document));
+    assert.doesNotMatch(page, /malformed-detached-signature|conf-sshd-signed-v1/);
+  }
+});
+
+test("signature and certificate availability are independent and never expose their bytes", () => {
+  const document = "document-bytes-must-not-appear";
+  const signature = "-----BEGIN PGP SIGNATURE-----\nComment: signature-bytes-must-not-appear\n\nAQID\n-----END PGP SIGNATURE-----\n";
+  const certificate = "-----BEGIN PGP PUBLIC KEY BLOCK-----\ncertificate-bytes-must-not-appear\n-----END PGP PUBLIC KEY BLOCK-----\n";
+  const paired = {keysText: document, signedDocument: document, signedMetadata: {listId: "test-list"}};
+  const cases = [
+    {name: "document alone", data: paired, signature: false, certificate: false},
+    {name: "malformed detached signature", data: {...paired, signature: "malformed-signature-must-not-appear"}, signature: false, certificate: false},
+    {name: "valid pair without certificate", data: {...paired, signature}, signature: true, certificate: false},
+    {name: "certificate without signature", data: {...paired, publicCertificate: certificate}, signature: false, certificate: true},
+    {name: "valid pair with certificate", data: {...paired, signature, publicCertificate: certificate}, signature: true, certificate: true},
+    {name: "wrong document pair", data: {...paired, keysText: "different-document", signature}, signature: false, certificate: false},
+    {name: "explicit unavailable flags", data: {...paired, signature, publicCertificate: certificate, signatureAvailable: false, publicCertificateAvailable: false}, signature: false, certificate: false},
+    {name: "explicit available flags", data: {signatureAvailable: true, publicCertificateAvailable: true}, signature: true, certificate: true},
+    {name: "unavailable keys retain independent certificate", data: {...paired, source: {type: "unavailable"}, signatureAvailable: true, publicCertificate: certificate}, signature: false, certificate: true},
+  ];
+  for (const entry of cases) {
+    const page = renderPage(html, snapshot(entry.data));
+    const metadata = embeddedMetadata(page);
+    assert.equal(metadata.signaturePresent, entry.signature, entry.name);
+    assert.equal(metadata.certificatePresent, entry.certificate, entry.name);
+    assert.equal(metadata.signatureStatus, entry.signature ? "签名包已提供（待客户端验证）" : "未提供签名包", entry.name);
+    assert.equal(metadata.certificateStatus, entry.certificate ? "公开证书已提供（安装时核验）" : "未提供公开证书", entry.name);
+    assert.equal(page.includes('href="/public-key.gpg"'), entry.certificate, entry.name);
+    assert.doesNotMatch(page, /must-not-appear|BEGIN PGP|AQID/, entry.name);
+    assert.equal(metadata.signedMetadata, undefined);
+    assert.equal(metadata.signature, undefined);
+    assert.equal(metadata.publicCertificate, undefined);
+  }
+});
+
+test("commands use an explicit installer and fixed installed client; no self-update command", () => {
+  const byId = Object.fromEntries(commands.map((command) => [command.id, command]));
+  assert.equal(byId.install.command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- --install --download-script -c");
+  assert.equal(byId.once.command, 'sh "$HOME/.conf-sshd/conf-sshd.sh" -o');
+  assert.equal(byId.preview.command, 'sh "$HOME/.conf-sshd/conf-sshd.sh" -o --dry-run');
+  assert.equal(byId.help.command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- -h");
+  assert.match(byId.help.description, /不建立信任/);
+  assert.match(byId.install.description, /备份.*保留本地配置/);
+  assert.match(byId.install.description, /首次安装或明确重装都会信任你执行的脚本/);
+  assert.match(byId.install.description, /推荐先独立核验安装脚本/);
+  assert.doesNotMatch(byId.install.description, /重装须使用.*本地脚本/);
+  assert.equal(byId.update, undefined);
+  for (const id of ["root-off", "root-on", "uninstall"]) {
+    assert.equal(byId[id].advanced, true);
+    assert.ok(byId[id].command.startsWith('sh "$HOME/.conf-sshd/conf-sshd.sh"'));
+  }
+  assert.ok(commands.every(({command}) => !/(?:^|\s)-u(?:\s|$)|--update/.test(command)));
+  assert.match(html, /预期 SHA-256.*pin/);
+  assert.match(html, /验签默认关闭/);
+  assert.match(html, /--install --gpg-verification on/);
+  assert.match(html, /远端发布内容不能关闭本地验签/);
+  assert.match(html, /本地终端确认完整指纹，不能跳过确认/);
+  assert.match(html, /日常同步不联网刷新证书/);
+  assert.doesNotMatch(html, /--confirm-trust/);
+  assert.match(html, /不请求签名/);
+  assert.match(html, /两者均返回 200/);
+  assert.match(html, /href="\/ssh\.keys\.sig"/);
+  assert.doesNotMatch(html, /\/key-release/);
 });
 
 test("default follows system and explicit light/dark/system choices persist", () => {
@@ -119,13 +241,13 @@ test("storage restrictions do not prevent theme selection or enhancement", () =>
   for (const pre of page.pres) assert.equal(pre.getAttribute("tabindex"), "0");
 });
 
-test("individual key and command copies retain every byte, including comments and punctuation", async () => {
-  const exact = `ssh-ed25519 ${"A".repeat(2000)} user <script> & \"quoted\" 中文`;
+test("individual command copies retain every byte, including shell quotes and punctuation", async () => {
+  const exact = `sh "$HOME/${"long-path-".repeat(250)}/conf-sshd.sh" -o --dry-run`;
   const copied = [];
-  const page = setup({ keys: [exact], clipboard: async (text) => copied.push(text) });
+  const page = setup({ commandTexts: [commands[0].command, exact], clipboard: async (text) => copied.push(text) });
   await page.buttons[0].dispatch("click");
   await page.buttons[1].dispatch("click");
-  assert.deepEqual(copied, [exact, page.codeElements[1].textContent]);
+  assert.deepEqual(copied, [commands[0].command, exact]);
   assert.equal(page.buttons[0].dataset.state, "success");
   assert.match(page.buttons[0].getAttribute("aria-label"), /已复制/);
   assert.equal(page.buttons[0].disabled, false);
@@ -133,32 +255,29 @@ test("individual key and command copies retain every byte, including comments an
   page.flushTimers();
   assert.equal(page.elements.get("copy-status").textContent, "已复制完整内容。");
   assert.equal(page.buttons[0].dataset.state, undefined);
-  assert.equal(page.buttons[0].getAttribute("aria-label"), "复制 key-0");
+  assert.equal(page.buttons[0].getAttribute("aria-label"), "复制 command-0");
 });
 
-test("copy all contains only raw public keys and a final LF, never commands", async () => {
-  const keys = ["ssh-ed25519 AAAA key one", "ssh-rsa BBBB key two"];
+test("page enhancement neither requests key data nor reads embedded release metadata", () => {
+  const page = setup();
+  assert.ok(!page.requestedIds.includes("release-data"));
+  assert.ok(!page.requestedIds.includes("copy-all-keys"));
+  assert.doesNotMatch(script, /release-data|release\.keys|key-card|allKeysButton|JSON\.parse|\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource/);
+});
+
+test("missing command targets disable only their own copy buttons", async () => {
   const copied = [];
-  const page = setup({ keys, clipboard: async (text) => copied.push(text) });
-  await page.elements.get("copy-all-keys").dispatch("click");
-  assert.deepEqual(copied, [`${keys.join("\n")}\n`]);
-  assert.ok(!copied[0].includes("curl"));
+  const page = setup({missingTarget: true, clipboard: async (text) => copied.push(text)});
+  assert.equal(page.buttons[0].disabled, true);
+  await page.buttons[0].dispatch("click");
+  await page.buttons[1].dispatch("click");
+  assert.deepEqual(copied, [page.codeElements[1].textContent]);
 });
 
-test("missing or malformed release metadata falls back to prerendered keys", async () => {
-  for (const rawRelease of ["not json", "{}", '{"keys":[null]}']) {
-    const copied = [];
-    const page = setup({ keys: ["ssh-ed25519 AAAA fallback"], rawRelease, clipboard: async (text) => copied.push(text) });
-    await page.elements.get("copy-all-keys").dispatch("click");
-    assert.deepEqual(copied, ["ssh-ed25519 AAAA fallback\n"]);
-  }
-  assert.equal(setup({ keys: [] }).elements.get("copy-all-keys").disabled, true);
-});
-
-test("denied or unavailable clipboard offers exact text for manual copy and returns focus", async () => {
+test("denied or unavailable clipboard offers exact command for manual copy and returns focus", async () => {
   for (const clipboard of [null, async () => { throw new Error("NotAllowedError"); }]) {
-    const exact = "ssh-ed25519 AAAA comment <not markup>";
-    const page = setup({ keys: [exact], clipboard });
+    const exact = commands[0].command;
+    const page = setup({ commandTexts: [exact], clipboard });
     await page.buttons[0].dispatch("click");
     const dialog = page.elements.get("copy-fallback");
     const textarea = page.elements.get("fallback-text");
@@ -197,33 +316,10 @@ test("repeated clicks while clipboard is pending make a single request and retri
   assert.equal(page.buttons[0].dataset.state, "success");
 });
 
-test("unavailable or explicitly revoked key sets leave copy-all disabled and make no clipboard request", async () => {
-  for (const sourceStatus of ["暂不可用", "明确撤销"]) {
-    const copied = [];
-    const page = setup({ keys: [], rawRelease: JSON.stringify({ keys: [], sourceStatus }), clipboard: async (text) => copied.push(text) });
-    assert.equal(page.elements.get("copy-all-keys").disabled, true);
-    await page.elements.get("copy-all-keys").dispatch("click");
-    assert.deepEqual(copied, []);
-  }
-  assert.match(html, /公钥来源/);
-  assert.match(html, /代码版本/);
-  assert.match(html, /公钥版本/);
-  assert.match(html, /class="keys-notice" role="note"/);
-});
-
 test("CSS covers system theme, narrow viewports, touch copies, focus, and reduced motion", () => {
-  assert.match(css, /prefers-color-scheme: dark/);
-  assert.match(css, /:root\[data-theme="dark"\]/);
-  assert.match(css, /max-width: 680px/);
-  assert.match(css, /hover: hover/);
-  assert.match(css, /pointer: fine/);
-  assert.match(css, /focus-within/);
-  assert.match(css, /focus-visible/);
-  assert.match(css, /overflow-x: auto/);
-  assert.match(css, /prefers-reduced-motion/);
-  assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|\beval\s*\(|\bfetch\s*\(/);
+  for (const pattern of [/prefers-color-scheme: dark/, /:root\[data-theme="dark"\]/, /max-width: 680px/, /hover: hover/, /pointer: fine/, /focus-within/, /focus-visible/, /overflow-x: auto/, /prefers-reduced-motion/]) assert.match(css, pattern);
+  assert.doesNotMatch(script, /innerHTML|insertAdjacentHTML|\beval\s*\(/);
 });
-
 
 test("touch and narrow layouts explicitly override desktop copy-button hiding", () => {
   const override = css.match(/@media \(hover: none\), \(pointer: coarse\), \(any-pointer: coarse\), \(max-width: 680px\) \{[\s\S]*?\n\}/);

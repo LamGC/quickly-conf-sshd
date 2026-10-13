@@ -20,12 +20,13 @@ jobs:
       - run: npm ci
       - name: Install shell test interpreters
         run: |
-          if ! command -v busybox >/dev/null || ! command -v shellcheck >/dev/null; then
+          if ! command -v busybox >/dev/null || ! command -v shellcheck >/dev/null || ! command -v gpg >/dev/null; then
             sudo apt-get update
-            sudo apt-get install -y busybox-static shellcheck
+            sudo apt-get install -y busybox-static shellcheck gnupg
           fi
           busybox sh -c 'echo "BusyBox shell ready"'
           shellcheck --version
+          gpg --version
       - name: Run unit, shell, and real-browser tests
         run: npm test
         env:

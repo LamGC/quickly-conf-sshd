@@ -81,10 +81,15 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
           await page.goto(fixture.origin + "/repository");
           await page.waitForSelector("html.enhanced");
           await noPageOverflow(page, width);
-          assert.equal(await page.locator("#key-0").textContent(), fixture.snapshots.repository.keys[0].text);
-          assert.equal(await page.locator(".key-card img").count(), 0, "key comments must remain text");
+          const install = fixture.snapshots.repository.commands.find((command) => command.id === "install").command;
+          assert.equal(await page.locator("#command-install").textContent(), install);
+          assert.equal(await page.locator(".key-card, [data-copy-target^='key-'], #copy-all-keys, #copy-all-commands").count(), 0);
+          const contents = await page.content();
+          assert.ok(!contents.includes(fixture.snapshots.repository.keys[0].text));
+          assert.ok(!contents.includes(fixture.snapshots.repository.keys[0].fingerprint));
+          assert.doesNotMatch(contents, /HOMEPAGE-MUST-NOT-LEAK|ssh-ed25519|SHA256:/);
           assert.equal(await page.evaluate(() => window.__injected), undefined);
-          assert.equal(await page.locator(".key-card pre").evaluate((pre) => pre.scrollWidth > pre.clientWidth), true);
+          assert.equal(await page.locator("#command-install").locator("xpath=..").evaluate((pre) => pre.scrollWidth > pre.clientWidth), true);
           assert.equal(await page.locator("#theme-picker").inputValue(), "system");
           assert.equal(await page.locator("html").getAttribute("data-theme"), null);
           const lightBackground = await page.locator("body").evaluate((body) => getComputedStyle(body).backgroundColor);
@@ -108,103 +113,108 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
           assert.equal(await page.locator("body").evaluate((body) => getComputedStyle(body).backgroundColor), lightBackground);
           assert.equal(await page.evaluate(() => localStorage.getItem("quickly-conf-sshd-theme")), "system");
 
-          const keyButton = page.locator('[data-copy-target="key-0"]');
+          const commandButton = page.locator('[data-copy-target="command-install"]');
           if (width < 600) {
-            assert.equal(await keyButton.evaluate((button) => getComputedStyle(button).opacity), "1", "touch copy buttons stay visible");
+            assert.equal(await commandButton.evaluate((button) => getComputedStyle(button).opacity), "1", "touch copy buttons stay visible");
           } else {
             await page.locator("#page-title").hover();
-            await page.waitForFunction(() => getComputedStyle(document.querySelector('[data-copy-target="key-0"]')).opacity === "0");
+            await page.waitForFunction(() => getComputedStyle(document.querySelector('[data-copy-target="command-install"]')).opacity === "0");
           }
-          await keyButton.focus();
-          await page.waitForFunction(() => getComputedStyle(document.querySelector('[data-copy-target="key-0"]')).opacity === "1");
+          await commandButton.focus();
+          await page.waitForFunction(() => getComputedStyle(document.querySelector('[data-copy-target="command-install"]')).opacity === "1");
           await page.keyboard.press("Enter");
-          await page.waitForFunction(() => document.querySelector('[data-copy-target="key-0"]').dataset.state === "success");
-          assert.equal(await page.evaluate(() => window.__clipboardTest.values[0]), fixture.snapshots.repository.keys[0].text);
-          assert.match(await keyButton.getAttribute("aria-label"), /已复制/);
+          await page.waitForFunction(() => document.querySelector('[data-copy-target="command-install"]').dataset.state === "success");
+          assert.equal(await page.evaluate(() => window.__clipboardTest.values[0]), install);
+          assert.match(await commandButton.getAttribute("aria-label"), /已复制/);
           await page.waitForFunction(() => document.getElementById("copy-status").textContent.includes("已复制"));
 
-          await page.locator("#copy-all-keys").click();
-          const allKeys = fixture.snapshots.repository.keys.map((key) => key.text).join("\n") + "\n";
-          assert.equal(await page.evaluate(() => window.__clipboardTest.values[1]), allKeys);
           assert.equal(await page.locator("#copy-all-commands").count(), 0);
           await page.locator("details summary").click();
-          await page.locator('[data-copy-target="command-uninstall"]').focus();
-          await page.keyboard.press("Enter");
-          const uninstall = fixture.snapshots.repository.commands.find((command) => command.id === "uninstall").command;
-          assert.equal(await page.evaluate(() => window.__clipboardTest.values.at(-1)), uninstall);
+          for (const command of fixture.snapshots.repository.commands.filter((entry) => entry.id !== "install")) {
+            const button = page.locator(`[data-copy-target="command-${command.id}"]`);
+            await button.focus();
+            await page.keyboard.press("Enter");
+            await page.waitForFunction((id) => document.querySelector(`[data-copy-target="command-${id}"]`).dataset.state === "success", command.id);
+            assert.equal(await page.evaluate(() => window.__clipboardTest.values.at(-1)), command.command);
+          }
           await noPageOverflow(page, width);
 
           await page.evaluate(() => { window.__clipboardTest.reject = true; });
-          await keyButton.focus();
+          await commandButton.focus();
           await page.keyboard.press("Enter");
           await page.waitForSelector("#copy-fallback[open]");
-          assert.equal(await page.locator("#fallback-text").inputValue(), fixture.snapshots.repository.keys[0].text);
+          assert.equal(await page.locator("#fallback-text").inputValue(), install);
           assert.deepEqual(await page.locator("#fallback-text").evaluate((textarea) => ({
             start: textarea.selectionStart, end: textarea.selectionEnd, focused: document.activeElement === textarea,
-          })), { start: 0, end: fixture.snapshots.repository.keys[0].text.length, focused: true });
-          assert.equal(await keyButton.getAttribute("data-state"), null, "failed copy must not show success");
+          })), { start: 0, end: install.length, focused: true });
+          assert.equal(await commandButton.getAttribute("data-state"), null, "failed copy must not show success");
           await capture(page, `homepage-${width}-manual-copy`);
           await page.keyboard.press("Escape");
           assert.equal(await page.locator("#copy-fallback").evaluate((dialog) => dialog.open), false);
-          assert.equal(await keyButton.evaluate((button) => document.activeElement === button), true);
+          assert.equal(await commandButton.evaluate((button) => document.activeElement === button), true);
           await page.keyboard.press("Enter");
           await page.waitForSelector("#copy-fallback[open]");
           await page.locator("#close-copy-fallback").click();
-          assert.equal(await keyButton.evaluate((button) => document.activeElement === button), true);
+          assert.equal(await commandButton.evaluate((button) => document.activeElement === button), true);
           assert.deepEqual(errors, []);
           assert.deepEqual(externalRequests, []);
         } finally { await context.close(); }
       });
     }
 
-    await t.test("all source states render the same snapshot into metadata, keys and copy data", async () => {
+    await t.test("source states expose metadata only and never fetch key or certificate APIs", async () => {
       const { context, externalRequests } = await guardedContext(browser, fixture, { viewport: { width: 390, height: 844 } });
       try {
         await installClipboardMock(context);
         const page = await context.newPage();
-        for (const [state, sourceText] of [["repository", "可用"], ["fallback", "备用源可用"], ["unavailable", "暂不可用"], ["pending", "暂不可用"], ["explicit-empty", "明确撤销"]]) {
+        for (const [state, sourceText] of [["repository", "可用"], ["gist", "可用"], ["fallback", "备用源可用"], ["unavailable", "暂不可用"], ["pending", "待获取"], ["explicit-empty", "明确撤销"]]) {
           const response = await page.goto(fixture.origin + "/" + state);
           assert.equal(response.status(), state === "unavailable" ? 503 : 200);
           await page.waitForSelector("html.enhanced");
           assert.equal(await page.locator(".source-status").textContent(), sourceText);
           const snapshot = fixture.snapshots[state];
-          assert.equal(await page.locator(".key-count").textContent(), String(snapshot.keys.length));
-          assert.equal(await page.locator("#copy-all-keys").isDisabled(), snapshot.keys.length === 0);
+          assert.equal(await page.locator(".key-count").textContent(), String(snapshot.keyCount));
+          assert.equal(await page.locator(".key-card, #copy-all-keys, [data-copy-target^='key-']").count(), 0);
           const embedded = await page.locator("#release-data").evaluate((element) => JSON.parse(element.textContent));
           assert.equal(embedded.source.type, state);
-          assert.deepEqual(embedded.keys, snapshot.keys);
-          assert.equal(embedded.keyRevision, snapshot.sha256);
+          assert.equal(embedded.keys, undefined);
+          assert.equal(embedded.keyRevision, snapshot.keyRevision || snapshot.sha256);
+          assert.equal(embedded.signaturePresent, Boolean(snapshot.signature && snapshot.signedDocument === snapshot.keysText));
+          assert.equal(embedded.certificatePresent, Boolean(snapshot.publicCertificate));
+          assert.equal(await page.locator(".signature-status").textContent(), snapshot.signature ? "签名包已提供（待客户端验证）" : "未提供签名包");
+          assert.equal(await page.locator(".certificate-status").textContent(), snapshot.publicCertificate ? "公开证书已提供（安装时核验）" : "未提供公开证书");
+          assert.equal(await page.locator('a[href="/public-key.gpg"]').count(), snapshot.publicCertificate ? 1 : 0);
           assert.equal(await page.locator(".release-revision").first().textContent(), snapshot.revision.slice(0, 12));
-          assert.equal(await page.locator(".release-revision").nth(1).textContent(), snapshot.sha256?.slice(0, 12) || "—");
+          assert.equal(await page.locator(".release-revision").nth(1).textContent(), (snapshot.keyRevision || snapshot.sha256)?.slice(0, 12) || "—");
+          const content = await page.content();
+          assert.doesNotMatch(content, /HOMEPAGE-MUST-NOT-LEAK|ssh-ed25519|SHA256:|\"keys\"\s*:/);
           if (state === "fallback") {
             assert.equal(await page.locator(".source-label").textContent(), "备用源：" + snapshot.source.url);
             assert.equal(await page.locator(".source-label script").count(), 0);
-            await page.locator("#copy-all-keys").click();
-            assert.equal(await page.evaluate(() => window.__clipboardTest.values[0]), snapshot.keys.map((key) => key.text).join("\n") + "\n");
           }
-          if (state === "unavailable" || state === "pending") {
-            assert.match(await page.locator(".keys-notice").textContent(), /未发布撤销指令.*保留上次成功密钥/);
-            assert.equal(await page.locator(".key-card").count(), 0);
-          }
+          if (state === "gist") assert.equal(await page.locator(".source-label").textContent(), "Gist：" + snapshot.source.url);
+          if (state === "unavailable" || state === "pending") assert.match(await page.locator(".keys-notice").textContent(), /未发布撤销指令.*保留上次成功密钥/);
           if (state === "explicit-empty") assert.match(await page.locator(".keys-notice").textContent(), /明确撤销全部受管理公钥/);
           assert.equal(await page.evaluate(() => window.__injected), undefined);
           await noPageOverflow(page, 390);
-          await capture(page, "source-" + state);
+          // Repository appearance is already captured in both viewports above: 12 screenshots in total.
+          if (state !== "repository") await capture(page, "source-" + state);
         }
         assert.deepEqual(externalRequests, []);
       } finally { await context.close(); }
     });
 
-    await t.test("no-JavaScript page retains keys, commands, source states and system theme", async () => {
+    await t.test("no-JavaScript page retains metadata, commands, source states and system theme", async () => {
       const { context, externalRequests } = await guardedContext(browser, fixture, {
         viewport: { width: 390, height: 844 }, javaScriptEnabled: false, colorScheme: "dark",
       });
       try {
         const page = await context.newPage();
         await page.goto(fixture.origin + "/repository");
-        assert.equal(await page.locator("#key-0").isVisible(), true);
+        assert.equal(await page.locator("#key-status").isVisible(), true);
+        assert.equal(await page.locator(".key-card, [data-copy-target^='key-'], #copy-all-keys").count(), 0);
         assert.equal(await page.locator("#command-install").isVisible(), true);
-        assert.equal(await page.locator("#copy-all-keys").isVisible(), false);
+        assert.equal(await page.locator('[data-copy-target="command-install"]').isVisible(), false);
         assert.equal(await page.locator("#theme-picker").isVisible(), false);
         assert.match(await page.locator("noscript").textContent(), /手动选择复制/);
         await page.locator("details summary").click();
@@ -217,6 +227,7 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
         assert.deepEqual(externalRequests, []);
       } finally { await context.close(); }
     });
+    assert.ok(fixture.requests.every((path) => !["/ssh.keys", "/ssh.keys.sig", "/public-key.gpg", "/key-release", "/release.json"].includes(path)), "homepage must not fetch public-key or certificate material");
   } finally {
     await browser?.close();
     await fixture.close();

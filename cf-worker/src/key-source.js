@@ -1,3 +1,5 @@
+import {parsePublishedSignedRelease, withoutKeyComments, SIGNED_BUNDLE_MAX_BYTES, SIGNATURE_SEPARATOR, SIGNED_RELEASE_LIMITS, validateListId} from './signed-release.js';
+
 // Runtime fallback is deliberately stateless: a request never reuses earlier keys.
 export const KEY_SOURCE_LIMITS = Object.freeze({sources: 5, timeoutMs: 3000, maxBytes: 1024 * 1024, maxKeys: 1000});
 const encoder = new TextEncoder();
@@ -133,15 +135,42 @@ export async function makeKeyBundle(keys, revision, allowEmpty) {
   if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error('Release revision must be a 40-character Git commit SHA.');
   if (typeof allowEmpty !== 'boolean') throw new Error('allowEmpty must be an explicit boolean.');
   if (!keys.length && !allowEmpty) throw new Error('An empty key set requires explicit revocation.');
-  const payload = keys.map(key => `${key.text}\n`).join('');
+  const payload = withoutKeyComments(keys).map(key => `${key.text}\n`).join('');
   const digest = hex(await sha256(encoder.encode(payload)));
   const text = `# conf-sshd-v1\n# revision ${revision}\n# key-count ${keys.length}\n# allow-empty ${allowEmpty ? 'yes' : 'no'}\n# sha256 ${digest}\n# end-metadata\n${payload}`;
   if (encoder.encode(text).length > KEY_SOURCE_LIMITS.maxBytes) throw new SourceError('too-large');
   return {sha256: digest, text};
 }
-async function snapshot(keys, release, source) {
-  const bundle = await makeKeyBundle(keys, release.revision, release.allowEmpty);
-  return {keys, keysText: bundle.text, sha256: bundle.sha256, keyCount: keys.length, allowEmpty: release.allowEmpty, source, revision: release.revision, keyRevision: bundle.sha256, fetchedAt: new Date().toISOString()};
+async function snapshot(keys, release, source, signed = null) {
+  if (!/^[0-9a-f]{40}$/.test(release.revision)) throw Error('Release revision must be a 40-character Git commit SHA.');
+  keys = withoutKeyComments(keys);
+  const allowEmpty = signed ? signed.metadata.revoke : release.allowEmpty;
+  const bundle = signed ? {text: signed.document, sha256: hex(await sha256(encoder.encode(keys.map(key => key.text + '\n').join(''))))} : await makeKeyBundle(keys, release.revision, allowEmpty);
+  return {keys, keysText: signed?.document ?? bundle.text, sha256: bundle.sha256, keyCount: keys.length, allowEmpty, source, revision: release.revision, keyRevision: signed ? signed.metadata.documentSha256 : bundle.sha256, fetchedAt: new Date().toISOString(), signedDocument: signed?.document ?? null, signature: signed?.signature ?? null, signatureAvailable: Boolean(signed?.signature), signedBundle: signed?.bundle ?? null, signedMetadata: signed?.metadata ?? null};
+}
+
+export function validateKeySource(value = {type: 'git'}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('keySource must be an object.');
+  const allowed = value.type === 'git' ? ['type'] : ['type', 'id', 'ownerId', 'ownerLogin', 'file', 'signatureFile', 'bundleFile'];
+  if (!['git', 'gist'].includes(value.type) || Object.keys(value).some(key => !allowed.includes(key))) throw Error('Invalid keySource configuration.');
+  if (value.type === 'git') return {type: 'git'};
+  if (typeof value.id !== 'string' || !/^[0-9a-f]{5,64}$/.test(value.id)) throw Error('Gist source requires a fixed lowercase hexadecimal ID.');
+  if (!Number.isSafeInteger(value.ownerId) || value.ownerId < 1) throw Error('Gist source requires a positive numeric ownerId.');
+  if (typeof value.ownerLogin !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(value.ownerLogin)) throw Error('Gist source requires an ownerLogin display name.');
+  const file = value.file ?? 'ssh.keys', signatureFile = value.signatureFile ?? `${file}.sig`, bundleFile = value.bundleFile ?? 'release.bundle';
+  for (const name of [file, signatureFile, bundleFile]) if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) throw Error('Gist filenames must be fixed plain filenames.');
+  if (new Set([file, signatureFile, bundleFile]).size !== 3) throw Error('Gist key, signature, and bundle filenames must differ.');
+  return {type: 'gist', id: value.id, ownerId: value.ownerId, ownerLogin: value.ownerLogin, file, signatureFile, bundleFile};
+}
+
+export function validateSignedReleaseConfig(value) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['listId', 'publicKeyFile', 'fingerprint'].includes(key))) throw Error('Invalid signedRelease configuration.');
+  validateListId(value.listId);
+  if (Boolean(value.publicKeyFile) !== Boolean(value.fingerprint)) throw Error('Build signature verification requires both publicKeyFile and fingerprint.');
+  if (value.publicKeyFile !== undefined && (typeof value.publicKeyFile !== 'string' || !/^keys\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.publicKeyFile))) throw Error('Signing public key must be a fixed file inside keys/.');
+  if (value.fingerprint !== undefined && (typeof value.fingerprint !== 'string' || !/^[A-Fa-f0-9]{40}$/.test(value.fingerprint))) throw Error('Signing fingerprint must be the complete 40-character primary fingerprint.');
+  return {listId: value.listId, ...(value.publicKeyFile ? {publicKeyFile: value.publicKeyFile, fingerprint: value.fingerprint.toUpperCase()} : {})};
 }
 function boundedOption(options, name) {
   const value = options[name] ?? KEY_SOURCE_LIMITS[name];
@@ -181,43 +210,125 @@ async function readBody(response, signal, maxBytes) {
     reader.releaseLock();
   }
 }
-async function fetchSource(url, fetchImpl, limits) {
+async function withDeadline(limits, operation, onTimeout) {
   const controller = new AbortController();
-  let timer, response;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => { reject(new SourceError('timeout')); controller.abort(); }, limits.timeoutMs);
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => { const recovery = onTimeout?.(); recovery === undefined ? reject(new SourceError('timeout')) : resolve(recovery); controller.abort(); }, limits.timeoutMs);
   });
-  const operation = (async () => {
-    try {
-      response = await fetchImpl(url, {method: 'GET', redirect: 'manual', cache: 'no-store', headers: {'Accept': 'text/plain, application/octet-stream;q=0.9', 'Cache-Control': 'no-cache, no-store', 'Pragma': 'no-cache'}, signal: controller.signal});
-      if (controller.signal.aborted) throw new SourceError('timeout');
-      if (response.redirected || (response.status >= 300 && response.status < 400)) throw new SourceError('redirect', response.status);
-      if (!response.ok) throw new SourceError('http-error', response.status);
-      const body = await readBody(response, controller.signal, limits.maxBytes);
-      let keys;
-      try { keys = await parsePublicKeys(body, {maxKeys: limits.maxKeys, signal: controller.signal}); } catch { throw new SourceError('invalid-keys'); }
-      if (!keys.length) throw new SourceError('empty');
-      return keys;
-    } finally {
-      if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
-    }
-  })();
-  try { return await Promise.race([operation, timeout]); }
+  try { return await Promise.race([operation(controller.signal), timeout]); }
   finally { clearTimeout(timer); }
 }
+async function fetchText(url, fetchImpl, signal, maxBytes, github = false) {
+  let response;
+  try {
+    response = await fetchImpl(url, {method: 'GET', redirect: 'manual', cache: 'no-store', headers: {'Accept': github ? 'application/vnd.github+json' : 'text/plain, application/octet-stream;q=0.9', 'Cache-Control': 'no-cache, no-store', 'Pragma': 'no-cache', ...(github ? {'User-Agent': 'conf-sshd-key-source', 'X-GitHub-Api-Version': '2022-11-28'} : {})}, signal});
+    if (signal.aborted) throw new SourceError('timeout');
+    if (response.redirected || (response.status >= 300 && response.status < 400)) throw new SourceError('redirect', response.status);
+    if (response.status !== 200) throw new SourceError('http-error', response.status);
+    return await readBody(response, signal, maxBytes);
+  } finally {
+    if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {});
+  }
+}
+async function parseSourceText(body, release, limits, options, signal, signature = null) {
+  if (options.requireSigned || body.startsWith('# conf-sshd-signed-v1\n')) {
+    try {
+      const separator = body.indexOf(SIGNATURE_SEPARATOR);
+      const document = separator < 0 ? body : body.slice(0, separator);
+      if (separator >= 0) signature = body.slice(separator + SIGNATURE_SEPARATOR.length);
+      const signed = await parsePublishedSignedRelease(document, signature, {listId: release.signedRelease?.listId, now: options.now, checkFreshness: Boolean(options.requireSigned), requireSigned: options.requireSigned, signal});
+      if (signed.keys.length > limits.maxKeys) throw Error('Too many keys.');
+      return {keys: signed.keys, signed};
+    } catch { throw new SourceError('invalid-signed-release'); }
+  }
+  let keys;
+  try { keys = await parsePublicKeys(body, {maxKeys: limits.maxKeys, signal}); } catch { throw new SourceError('invalid-keys'); }
+  if (!keys.length) throw new SourceError('empty');
+  return {keys, signed: null};
+}
+async function fetchSource(url, fetchImpl, limits, release, options) {
+  let withoutSignature;
+  return withDeadline(limits, async signal => {
+    const body = await fetchText(url, fetchImpl, signal, limits.maxBytes === KEY_SOURCE_LIMITS.maxBytes ? SIGNED_BUNDLE_MAX_BYTES : limits.maxBytes);
+    if (body.startsWith('# conf-sshd-signed-v1\n') && !body.includes(SIGNATURE_SEPARATOR)) {
+      // A detached pair never combines different sources. A publication race remains a client signature failure.
+      withoutSignature = await parseSourceText(body, release, limits, {...options, requireSigned: false}, signal);
+      let signature = null;
+      try { signature = await fetchText(url + '.sig', fetchImpl, signal, SIGNED_RELEASE_LIMITS.signatureBytes); } catch { /* OFF remains usable when the optional signature is unavailable. */ }
+      return parseSourceText(body, release, limits, options, signal.aborted ? undefined : signal, signature);
+    }
+    return parseSourceText(body, release, limits, options, signal);
+  }, () => options.requireSigned ? undefined : withoutSignature);
+}
+async function fetchGist(source, fetchImpl, limits, release, options) {
+  return withDeadline(limits, async signal => {
+    // Both requests, streamed bodies and parsing share one deadline; never follow an upstream raw_url.
+    const get = async suffix => {
+      const body = await fetchText(`https://api.github.com/gists/${source.id}${suffix}`, fetchImpl, signal, 2 * SIGNED_BUNDLE_MAX_BYTES, true);
+      let data;
+      try { data = JSON.parse(body); } catch { throw new SourceError('invalid-gist'); }
+      if (!data || data.id !== source.id || data.owner?.id !== source.ownerId) throw new SourceError('gist-owner-mismatch');
+      if (data.public !== true || data.truncated === true || !data.files || typeof data.files !== 'object' || Array.isArray(data.files)) throw new SourceError('invalid-gist');
+      return data;
+    };
+    const latest = await get('');
+    const gistRevision = latest.history?.[0]?.version;
+    if (typeof gistRevision !== 'string' || !/^[0-9a-f]{40}$/.test(gistRevision)) throw new SourceError('invalid-gist-revision');
+    const pinned = await get(`/${gistRevision}`);
+    const filename = Object.hasOwn(pinned.files, source.bundleFile) ? source.bundleFile : source.file;
+    const file = pinned.files[filename];
+    if (!file || file.filename !== filename || file.truncated !== false || typeof file.content !== 'string' || (file.encoding !== undefined && file.encoding !== 'utf-8')) throw new SourceError('invalid-gist-file');
+    if (filename === source.bundleFile && (!file.content.startsWith('# conf-sshd-signed-v1\n') || !file.content.includes(SIGNATURE_SEPARATOR))) throw new SourceError('invalid-signed-release');
+    const size = encoder.encode(file.content).length;
+    const max = filename === source.bundleFile ? SIGNED_BUNDLE_MAX_BYTES : limits.maxBytes;
+    if (!Number.isSafeInteger(file.size) || file.size !== size || size > max) throw new SourceError('too-large');
+    // Optional signature is read only from this same immutable revision, never from latest/raw URLs.
+    let signature = null;
+    const signatureFile = pinned.files[source.signatureFile];
+    if (signatureFile && signatureFile.filename === source.signatureFile && signatureFile.truncated === false && typeof signatureFile.content === 'string' && (signatureFile.encoding === undefined || signatureFile.encoding === 'utf-8') && Number.isSafeInteger(signatureFile.size) && signatureFile.size === encoder.encode(signatureFile.content).length && signatureFile.size <= SIGNED_RELEASE_LIMITS.signatureBytes) signature = signatureFile.content;
+    const result = await parseSourceText(file.content, release, limits, options, signal, signature);
+    return {...result, source: {type: 'gist', id: source.id, ownerId: source.ownerId, ownerLogin: source.ownerLogin, gistRevision, file: filename, url: `https://gist.github.com/${source.ownerLogin}/${source.id}/${gistRevision}`}};
+  });
+}
 
-/** Only release-configured URLs are accepted; callers must never derive release data from a request. */
+/** Only release-configured sources are accepted. Worker checks structure, never claims OpenPGP verification. */
 export async function resolveKeys(release, fetchImpl = globalThis.fetch, internalOptions = {}) {
   if (!release || !Array.isArray(release.keys) || typeof release.allowEmpty !== 'boolean') throw new Error('Invalid deployed key release.');
-  if (release.keys.length) return snapshot(release.keys, release, {type: 'repository'});
-  // An explicit empty release means revoke. It must never be repopulated from a fallback.
-  if (release.allowEmpty) return snapshot([], release, {type: 'explicit-empty'});
-  const sources = validateFallbackSources(release.fallbackSources);
+  const keySource = validateKeySource(release.keySource);
+  validateSignedReleaseConfig(release.signedRelease);
+  if (internalOptions.requireSigned !== undefined && typeof internalOptions.requireSigned !== 'boolean') throw Error('requireSigned must be boolean.');
   const limits = {timeoutMs: boundedOption(internalOptions, 'timeoutMs'), maxBytes: boundedOption(internalOptions, 'maxBytes'), maxKeys: boundedOption(internalOptions, 'maxKeys')};
+  const sources = validateFallbackSources(release.fallbackSources);
   const diagnostics = [];
+  if (keySource.type === 'git') {
+    if (release.signedDocument || release.signedBundle) {
+      // A malformed signed primary must never downgrade to different unsigned repository keys.
+      try {
+        const result = await parseSourceText(release.signedDocument || release.signedBundle, release, limits, internalOptions, undefined, release.signature ?? null);
+        return await snapshot(result.keys, release, {type: result.signed.metadata.revoke ? 'explicit-empty' : 'repository'}, result.signed);
+      } catch { diagnostics.push({index: -1, code: 'invalid-signed-release'}); }
+    } else if (!internalOptions.requireSigned) {
+      if (release.keys.length) return snapshot(release.keys, release, {type: 'repository'});
+      // An explicit empty release means revoke. It must never be repopulated from a fallback.
+      if (release.allowEmpty) return snapshot([], release, {type: 'explicit-empty'});
+    }
+    // An explicit unsigned empty primary cannot be replaced by signed fallback keys either.
+    if (!release.signedDocument && !release.signedBundle && release.allowEmpty && !release.keys.length) throw new FallbackUnavailableError([{index: -1, code: 'unsigned-revocation'}]);
+  } else {
+    try {
+      const result = await fetchGist(keySource, fetchImpl, limits, release, internalOptions);
+      return await snapshot(result.keys, release, result.source, result.signed);
+    } catch (error) { diagnostics.push(diagnostic(error, -1)); }
+  }
   for (const [index, url] of sources.entries()) {
-    try { return await snapshot(await fetchSource(url, fetchImpl, limits), release, {type: 'fallback', url}); }
-    catch (error) { diagnostics.push({index, code: error instanceof SourceError ? error.code : 'network-error', ...(error instanceof SourceError && error.status !== undefined ? {status: error.status} : {})}); }
+    try {
+      const result = await fetchSource(url, fetchImpl, limits, release, internalOptions);
+      return await snapshot(result.keys, release, {type: 'fallback', url}, result.signed);
+    } catch (error) { diagnostics.push(diagnostic(error, index)); }
   }
   throw new FallbackUnavailableError(diagnostics);
+}
+function diagnostic(error, index) {
+  return {index, code: error instanceof SourceError ? error.code : 'network-error', ...(error instanceof SourceError && error.status !== undefined ? {status: error.status} : {})};
 }

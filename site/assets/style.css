@@ -103,19 +103,16 @@ h1 { margin: 0; font-size: clamp(30px, 3.4vw, 42px); font-weight: 650; letter-sp
 .section-index { color: var(--subtle); font-size: 10px; margin: 0 0 8px; }
 .section-heading h2 { font-size: 23px; font-weight: 650; letter-spacing: -0.45px; line-height: 1.4; margin: 0; }
 .section-heading p:not(.section-index) { color: var(--muted); font-size: 12px; margin: 7px 0 0; max-width: 690px; }
-.section-actions { display: flex; align-items: center; gap: 18px; flex-shrink: 0; padding-bottom: 2px; }
+.section-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; flex-shrink: 0; padding-bottom: 2px; }
 .text-link { white-space: nowrap; color: var(--muted); font-size: 12px; }
 .text-link span { margin-left: 4px; }
 .keys-notice { margin: 0 0 15px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--muted); font-size: 12px; }
 .keys-notice:empty { display: none; }
-.key-list, .command-list { display: grid; gap: 14px; min-width: 0; }
+.command-list { display: grid; gap: 14px; min-width: 0; }
 .command-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.key-card, .command-card { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
-.key-card { padding: 18px; }
+.command-card { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
 .card-heading { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; min-width: 0; }
 .card-heading h3 { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; margin: 0; line-height: 1.65; }
-.key-type { flex-shrink: 0; max-width: 40%; overflow-wrap: anywhere; border: 1px solid var(--line); background: var(--surface-soft); border-radius: 4px; padding: 1px 7px; color: var(--muted); font: 10px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; }
-.fingerprint { color: var(--subtle); font: 11px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 6px 0 12px; overflow-wrap: anywhere; }
 .code-block { position: relative; min-width: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--code); }
 pre { overflow-x: auto; margin: 0; padding: 14px 62px 14px 14px; white-space: pre; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 11px; line-height: 1.8; }
@@ -129,8 +126,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Libe
 .copy-button[data-state="success"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
 .copy-button[data-state="success"]::before { width: 7px; height: 13px; left: calc(var(--icon-center) - 4px); top: 8px; border: solid currentColor; border-width: 0 2px 2px 0; border-radius: 0; transform: rotate(45deg); }
 .copy-button[data-state="success"]::after { display: none; }
-.copy-all { --icon-center: 19px; width: auto; gap: 8px; padding: 0 12px 0 38px; color: var(--accent); font-size: 12px; font-weight: 600; }
-.copy-all:disabled { opacity: 0.55; }
 .public-notice { display: flex; align-items: flex-start; gap: 9px; margin-top: 15px; color: var(--subtle); font-size: 11px; }
 .public-notice p { margin: 0; }
 .notice-icon { display: grid; place-items: center; flex: 0 0 14px; height: 14px; margin-top: 2px; border: 1px solid var(--subtle); border-radius: 50%; font: 10px/1 serif; }
@@ -143,6 +138,9 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Libe
 .advanced-commands summary::marker { color: var(--subtle); }
 .advanced-commands[open] summary { border-bottom: 1px solid var(--line); }
 .advanced-commands > .command-list { padding: 15px; }
+.trust-steps { margin: 0; padding-left: 22px; color: var(--muted); font-size: 12px; }
+.trust-steps li { padding-left: 4px; margin-block: 10px; }
+.trust-steps a { color: var(--accent); }
 .command-note { font-size: 11px; color: var(--subtle); margin: 14px 0 0; }
 .empty-state { padding: 26px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); text-align: center; }
 .preview-notice { margin: 24px 0 0; padding: 12px 16px; border: 1px solid var(--accent-line); border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 12px; }
@@ -204,16 +202,14 @@ dialog::backdrop { background: rgb(10 22 15 / 52%); }
   .section-heading h2 { font-size: 21px; }
   .section-actions { width: 100%; justify-content: space-between; }
   .commands-section > .section-heading > .text-link { margin-top: -3px; }
-  .key-card, .command-card { padding: 14px; }
+  .command-card { padding: 14px; }
   .command-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .card-heading { gap: 8px; }
-  .fingerprint { font-size: 10px; }
   pre { padding-left: 12px; padding-block: 16px; }
   .copy-button { width: 40px; height: 40px; }
   .copy-button::before { top: 11px; }
   .copy-button::after { top: 15px; }
   .copy-button[data-state="success"]::before { top: 10px; }
-  .copy-all { width: auto; }
   .public-notice { font-size: 11px; }
   .site-footer { flex-direction: column; align-items: flex-start; gap: 12px; padding: 22px 0 26px; }
   dialog { padding: 20px; }
@@ -224,5 +220,5 @@ dialog::backdrop { background: rgb(10 22 15 / 52%); }
   .page-shell { width: 100%; }
   .hero { padding-block: 24px; }
   pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .key-card, .command-card { break-inside: avoid; }
+  .command-card { break-inside: avoid; }
 }

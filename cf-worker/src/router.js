@@ -23,10 +23,14 @@ export function createHandler(release, {fetchImpl = globalThis.fetch} = {}) {
       return new Response(request.method === 'HEAD' ? null : body, {status, headers});
     };
     if (url.pathname === '/script.sh') return respond(release.script, 'text/plain; charset=utf-8');
+    if (url.pathname === '/public-key.gpg') {
+      if (!release.publicCertificate) return respond('No public signing certificate is configured.\n', 'text/plain; charset=utf-8', 404);
+      return respond(release.publicCertificate, 'application/pgp-keys');
+    }
     let snapshot;
-    if (['/ssh.keys','/release.json','/'].includes(url.pathname)) {
+    if (['/ssh.keys','/ssh.keys.sig','/release.json','/'].includes(url.pathname)) {
       const accept = request.headers.get('Accept') || '';
-      const legacyScript = url.pathname === '/' && !accept.toLowerCase().includes('text/html') && /(?:curl|libcurl)\//i.test(request.headers.get('User-Agent') || '');
+      const legacyScript = url.pathname === '/' && !accept.toLowerCase().includes('text/html') && /(?:curl|libcurl|wget|httpie)\//i.test(request.headers.get('User-Agent') || '');
       if (!legacyScript) {
         try {
           snapshot = {...release, ...await resolveKeys(release, fetchImpl)};
@@ -40,17 +44,26 @@ export function createHandler(release, {fetchImpl = globalThis.fetch} = {}) {
       }
     }
     if (url.pathname === '/ssh.keys') return respond(snapshot.keysText, 'text/plain; charset=utf-8');
+    if (url.pathname === '/ssh.keys.sig') {
+      // This detached signature covers every byte returned by /ssh.keys. Never
+      // manufacture a signature for an unsigned source or transform signed data.
+      if (!snapshot.signature || !snapshot.signedDocument || snapshot.keysText !== snapshot.signedDocument) {
+        return respond('No detached signature is available for this key response.\n', 'text/plain; charset=utf-8', 404);
+      }
+      return respond(snapshot.signature, 'application/pgp-signature');
+    }
     if (url.pathname === '/release.json') {
       return respond(JSON.stringify({schema:1,revision:snapshot.revision,publishedAt:snapshot.publishedAt,
-        keyCount:snapshot.keyCount,allowEmpty:snapshot.allowEmpty,sha256:snapshot.sha256,keyRevision:snapshot.sha256,
-        source:snapshot.source,fetchedAt:snapshot.fetchedAt,testFixture:Boolean(release.testFixture)})+'\n','application/json; charset=utf-8');
+        keyCount:snapshot.keyCount,allowEmpty:snapshot.allowEmpty,sha256:snapshot.sha256,keyRevision:snapshot.keyRevision ?? snapshot.sha256,
+        source:snapshot.source,fetchedAt:snapshot.fetchedAt,signatureAvailable:Boolean(snapshot.signature),certificateAvailable:Boolean(release.publicCertificate),
+        signedMetadata:snapshot.signedMetadata ?? null,signatureVerifiedByWorker:false,testFixture:Boolean(release.testFixture)})+'\n','application/json; charset=utf-8');
     }
     if (url.pathname === '/') {
       headers.set('Vary', 'Accept, User-Agent');
       const accept = request.headers.get('Accept') || '';
       const agent = request.headers.get('User-Agent') || '';
       // Explicit HTML wins; keep historic curl | sh entry point as a compatibility alias.
-      if (!accept.toLowerCase().includes('text/html') && /(?:curl|libcurl)\//i.test(agent)) {
+      if (!accept.toLowerCase().includes('text/html') && /(?:curl|libcurl|wget|httpie)\//i.test(agent)) {
         return respond(release.script, 'text/plain; charset=utf-8');
       }
       if (!release.pageTemplate) return respond('Homepage unavailable.\n', 'text/plain; charset=utf-8', 503);
