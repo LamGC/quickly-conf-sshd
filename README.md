@@ -264,6 +264,22 @@ npx wrangler deploy --dry-run --config cf-worker/wrangler.toml
 
 测试只使用临时 HOME、命令替身、公开测试 SSH 钥匙及临时无身份/无访问权限的 GPG 测试钥匙。真实浏览器测试仅访问 localhost。`build:test` 产物标记为测试，生产验证拒绝它；上线必须重新生产构建。
 
+### 真实 WKD / HKPS 集成测试
+
+CI 的 `Live public GPG discovery (external network)` 是独立任务，与 `npm test` 中不访问外部密钥服务的核心测试分开。它使用真实 GnuPG/dirmngr，在全新的临时钥匙环中通过 WKD、keys.openpgp.org 和 keyserver.ubuntu.com 发现公共证书，再用实际客户端的证书检查函数验证完整主指纹和指定签名子钥；不执行安装器、不改系统信任、不安装 SSH 服务。
+
+`tests/fixtures/live-discovery.json` 是**仅用于测试的固定公开身份**。Fork 或部署本项目时不应把它改成自己的邮箱/指纹；生产配置只修改 `deployment.json` 与 `keys/`。测试身份不作为服务器 SSH 授权密钥，也不会写入生成的安装默认值。只有维护集成测试本身（例如测试证书到期）时才需要更换此夹具。
+
+每个来源有独立的结果、有限超时与重试；网络/服务不可用和证书验证失败会明确报告并使该任务失败，不会静默跳过后标为通过。CI 摘要只保留来源、固定指纹与结果，不上传证书或其他 UID 信息。没有该身份签署的 SSH 公钥文档，因此此测试不声称完成了用户真实业务文档验签；签名验签和错误场景仍由隔离的临时测试钥匙覆盖。
+
+可显式运行同一外网测试：
+
+```sh
+node scripts/test-live-discovery.mjs
+```
+
+运行需要允许 dirmngr 创建本地 socket 并访问这些 HTTPS/HKPS 服务。受限环境中仅 HTTP 下载成功不代表 GPG 发现流程通过。
+
 ## License
 
 Apache-2.0，见 [LICENSE](LICENSE)。
