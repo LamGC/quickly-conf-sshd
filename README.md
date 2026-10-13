@@ -9,7 +9,7 @@
 
 > 初始生产清单和备用源为空，没有配置实际签名证书或发布凭据。生产构建不会偷偷使用测试密钥。仓库中的公钥文件不是 GitHub 账号登录凭据。
 
-## 使用与重新安装
+## Quick Usage 与重新安装
 
 先配置并部署自己的 Worker，再使用自己的域名。以下地址只是本项目的部署配置示例。
 
@@ -22,6 +22,28 @@ curl -fsSL 'https://ssh.lamgc.me/script.sh' | sh -s -- --install --download-scri
 再次执行安装命令会检测已安装脚本，备份并升级。签名策略只在已替换旧客户端之后激活；若后续磁盘写入失败，可能留下新脚本和未完成的配置，请按错误信息检查并显式重新安装，不要把失败当作策略已启用。已有本地配置和自定义定时计划默认保留，不因远端仓库默认值变化而重置。新安装默认每 15 分钟同步。
 
 **这条命令信任下载到的可执行脚本。** HTTPS、同一 Worker 提供的摘要和后续公钥验签，不能证明首次安装器本身可信。高信任安装应先取得独立渠道核对过的脚本摘要和完整 GPG 指纹，下载、核验本地文件后执行安装。不要把从同一被攻陷来源获得的指纹当作独立信任依据。
+
+原版 Quick Usage 的一次部署、只安装钥匙、root 策略与帮助入口继续保留。普通运行会按权限检查 SSH Server；root 缺少服务端时可按需安装，非 root 不安装系统包。`-n` 跳过服务端检查/安装，`-o` 只处理当前用户的钥匙，不配置 SSH 服务。
+
+一次部署，不设置定时任务：
+
+```sh
+curl -fsSL 'https://ssh.lamgc.me/' | sh -s
+```
+
+跳过 SSH Server 检查，只安装钥匙：
+
+```sh
+curl -fsSL 'https://ssh.lamgc.me/' | sh -s -- -o
+```
+
+显式设置 root 登录策略并部署钥匙（必须以 root 执行，可再加 `-c`）：
+
+```sh
+curl -fsSL 'https://ssh.lamgc.me/' | sh -s -- -p yes
+```
+
+`-p yes` 仅设置 `PermitRootLogin yes`，不额外打开 `PasswordAuthentication`。使用 `-p no` 设置 `prohibit-password`。会先验证钥匙、备份和校验配置；不会自动重载 SSH 服务，请保留恢复会话并按输出手动检查。
 
 日常同步、预览、状态使用已经落盘的脚本：
 
@@ -140,6 +162,16 @@ ON 客户端检查固定列表 ID、有效期和持久化的最高序号/摘要�
 
 下载/验签失败或清单过期会保留最后成功的密钥并报错，**不会自动清空密钥造成锁死**。攻击者仍可阻断更新；离线机器无法保证及时撤权。删除公钥不会终止已有会话，也不会移除管理区块外的手工重复钥匙。部署签名私钥或服务器本地管理员权限失陷超出这层保护范围。
 
+### 服务器本地验签审计
+
+仅在本地验签为 ON 时，成功更新会把 `/ssh.keys` 原始响应与配套 `/ssh.keys.sig` 原始签名保存到 `$HOME/.conf-sshd/audit/`。这是实际签名覆盖的完整文档，不是去掉元数据后写入 authorized_keys 的管理区块。
+
+- `current` 是严格格式的当前记录指针，指向 `a` 或 `b` 槽；槽内有 `ssh.keys`、`ssh.keys.sig` 和 `metadata`。两槽轮替，保留当前与上一份证据，不会随每次 cron 无限增长。
+- metadata 记录成功安装时间、列表 ID、序号、来源、实际签名主/子钥完整指纹、本地固定的指纹和模式、文档及签名摘要、客户端格式版本。它是本地辅助信息，不是额外签名的远端证明。
+- 下载或验签失败不覆盖当前成功证据。钥匙、回滚状态与审计指针无法跨文件一次性 rename；提交中断会保留恢复 journal，并且可能暂时没有 current 指针。没有 current 时，不应把任一槽猜作当前已安装证据；先检查错误并用同一固定客户端完成恢复。
+- OFF 不额外下载或保存签名；成功执行 OFF 更新会取消旧记录的 current 标记，旧证据仅作历史。仅改远端默认值不会关闭本地 ON。
+- 审计目录权限为 0700，文件为 0600；可结合本地固定证书离线复核签名。它不能防止服务器 root 篡改、删除证据，也不能证明包安装副作用、SSH 当前会话或整机快照未被回滚。
+
 ## 有序备用源
 
 有两份有意区分的配置：
@@ -164,7 +196,7 @@ Worker 上游请求有时间、流式字节数、数量限制，并拒绝重定�
 - `signedRelease`：签名列表身份和可公开发布的证书配置；不是私钥。
 - `clientDefaults`：首次安装的验签默认值、完整指纹、primary/subkey 范围、列表 ID 和可选公开 Email；不覆盖现有本地设置。
 
-构建需要 Node.js 22+、npm、Git、OpenSSH 客户端和 POSIX sh；GPG 验证/测试需要 `gpg`。服务器需要 curl、ssh-keygen、awk、mktemp、stat、常用 POSIX 工具及 sha256sum/shasum/openssl 之一，ON 还需要 gpg；计划任务需要 crontab。脚本不会自动安装软件。
+构建需要 Node.js 22+、npm、Git、OpenSSH 客户端和 POSIX sh；GPG 验证/测试需要 `gpg`。服务器需要 curl、ssh-keygen、awk、mktemp、stat、常用 POSIX 工具及 sha256sum/shasum/openssl 之一，ON 还需要 gpg；计划任务需要 crontab。普通部署可由 root 按需安装 openssh-server，以及启用计划时缺少的 cron/crontabs；支持的包管理器为 apt-get、dnf、yum。已有 sshd 配置无效不当作缺少软件重装。非 root 不安装系统包，缺少 ssh-keygen 时，正常 root 部署可在完成信任确认后先安装客户端工具以便验钥；`-o`、`-n` 和非 root 路径不会这样安装，其他工具仍须预先准备。
 
 ```sh
 npm ci
@@ -214,7 +246,11 @@ GitHub 的通用 Verified 标记不是本项目授权名单。最终 merge/squas
 
 仅操作当前用户 `$HOME/.ssh/authorized_keys` 的唯一配对管理区块。临时文件、锁、备份、同目录替换和写前快照检查避免可观察到的并发覆盖；不同编辑器不共享锁时仍无操作系统级原子比较交换保证。
 
-`-p yes/no` 是独立 root 高级操作，仅修改 PermitRootLogin，验证 `sshd -t/-T` 后替换，遇 Include/Match 等复杂配置拒绝；不会自动 reload/restart。普通安装/同步不修改 SSH 服务策略。
+`-p yes/no` 是显式 root 操作，可与普通部署、`--install`、`-c` 组合，不能与只更新钥匙的 `-o` 组合。只修改 PermitRootLogin，先验证公钥，再备份和验证 `sshd -t/-T`，最后替换配置；不改 PasswordAuthentication，不主动 reload/restart。默认部署不会改变登录策略。
+
+支持没有 Include/Match 的简单配置，以及仅包含标准 `Include /etc/ssh/sshd_config.d/*.conf`（或相对路径 `sshd_config.d/*.conf`）的配置。标准目录及文件必须安全、可读取，目录清单和文件内容在提交前复查。主文件或包含文件出现 Match、嵌套 Include，或其他 Include 写法时明确拒绝自动改策略，交由管理员检查；不会声称几个模拟连接就覆盖所有条件规则。
+
+普通部署会区分缺少 sshd 程序与现有配置无效。root 可按需安装 openssh-server，`-c` 时可按需安装 cron/crontabs；`-n` 跳过服务端检查/安装，`-o` 不执行这类系统操作。脚本不会主动执行服务 reload/restart，但发行版软件包的安装钩子可能启动服务或生成主机密钥。包安装不是可整体回滚的事务；后续失败会报告，已有钥匙和策略在验证前不改写。
 
 目标为 Linux dash、Bash POSIX 与 BusyBox ash。测试不等于真实服务器登录、SELinux、发行版服务管理或自定义 AuthorizedKeysFile 已验证。异常强制终止可能留下锁，人工确认原进程状态后再处理。
 

@@ -13,7 +13,8 @@ DEFAULT_GPG_EMAIL='@@DEFAULT_GPG_EMAIL@@'
 set -eu
 umask 077
 LC_ALL=C
-export LC_ALL
+PATH=${PATH:-/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin
+export LC_ALL PATH
 BEGIN_KEYS='# --- BEGIN MANAGED BY CONF-SSHD SCRIPT ---'
 END_KEYS='# --- END MANAGED BY CONF-SSHD SCRIPT ---'
 BEGIN_CRON='# --- BEGIN CRON MANAGED BY CONF-SSHD SCRIPT ---'
@@ -24,6 +25,9 @@ cron_value=
 dry_run=no
 no_install=no
 root_password=
+apt_index_updated=no
+cron_prepared=no
+auth_prepared=no
 temps=
 lock_owned=no
 created_state=no
@@ -51,7 +55,9 @@ fail() { printf 'conf-sshd: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'HELP'
 Usage: sh conf-sshd.sh [options]
-  (no options), -o, --only-update-keys  Validate and sync managed public keys only
+  (no options)                        Check/setup sshd for this user's privileges,
+                                      then validate and sync managed keys
+  -o, --only-update-keys               Keys only; never install packages or edit sshd
   -c, --cron ["five fields"|false]     Sync and schedule; bare -c keeps an existing
                                       schedule, otherwise the configured default.
                                       -c false only removes this script's schedule.
@@ -75,13 +81,14 @@ Usage: sh conf-sshd.sh [options]
   --fallback-urls-file FILE            Ordered one-HTTPS-endpoint-per-line fallbacks
   -u, --update-self                    Refused: reinstall explicitly with --install
   --uninstall                         Remove own schedule/script; preserve keys/config
-  -p, --allow-root-passwd yes|no       Explicit root-only sshd_config edit; never reload
-  -n, --no-install-sshd                Compatibility flag; packages are never installed
+  -p, --allow-root-passwd yes|no       Root-only policy edit plus key sync; may use -c
+                                      or --install; never reload sshd
+  -n, --no-install-sshd                Skip SSH package bootstrap/server installation
   --dry-run                           Validate and show changes without applying them
   --status                            Show local installation and schedule status
   -h, --help                          Show this help
 
--u, --uninstall, -p and --status are exclusive operations. -o cannot use -c or -p.
+-u, --uninstall and --status are exclusive operations. -o cannot use -c or -p.
 Trust/URL changes require explicit installation, or keys-only -o enrollment.
 --install -c also schedules; --install always validates and syncs keys.
 Running an installer from Worker explicitly trusts that bootstrap code. For higher
@@ -104,11 +111,19 @@ Strict mode needs GnuPG and a correct clock. A missing rollback-state file fails
 closed. With --min-sequence omitted, initial enrollment cannot detect a previously
 published, still-unexpired release being replayed; obtain a current floor out of band.
 Expired/invalid responses retain last installed keys; expiry is not automatic revocation.
+When verification is ON, two private audit slots retain successful original key
+responses/signatures and signer/source/time metadata. Only the current pointer
+marks a completed installation; an absent pointer with a pending journal means
+recovery is needed. OFF key updates invalidate current audit without fetching a
+signature. These files are locally editable by their owner, not tamper-proof.
 Local state uses atomic renames and a pending journal, not a power-loss fsync guarantee.
 Requires curl, ssh-keygen, awk, standard POSIX tools, mktemp, stat, and one of
 sha256sum, shasum or openssl. Scheduling also requires crontab. Downloads require
 HTTPS; existing keys survive any validation/download failure.
-No SSH service is installed, restarted, or reloaded. Keep recovery access ready.
+Normal root runs can install missing OpenSSH/cron using apt-get, dnf or yum.
+Non-root users never install packages or change system SSH policy. -o is keys only.
+Package hooks may start services or generate host keys. This script never directly
+starts, restarts or reloads sshd. Keep recovery access ready.
 The payload SHA-256 detects inconsistency; trust comes from HTTPS and its source.
 HELP
 }
@@ -133,7 +148,9 @@ while [ "$#" -gt 0 ]; do
             trust_options=yes ;;
         --gpg-verification|--public-key-file|--fingerprint|--gpg-fingerprint|--gpg-pin-mode|--gpg-email|--keyserver|--list-id|--min-sequence|--fallback-urls-file|--primary-url)
             option=$1
-            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$option requires a value."
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                fail "$option requires a value."
+            fi
             shift
             case $option in
                 --gpg-verification) [ -z "$requested_verification" ] || fail "Duplicate $option."; requested_verification=$1 ;;
@@ -152,7 +169,7 @@ while [ "$#" -gt 0 ]; do
         --uninstall) select_mode uninstall ;;
         --status) select_mode status ;;
         -p|--allow-root-passwd)
-            select_mode config
+            [ -z "$root_password" ] || fail 'Duplicate -p option.'
             [ "$#" -ge 2 ] || fail '-p requires yes or no.'
             shift; case $1 in yes|no) root_password=$1 ;; *) fail '-p requires yes or no.' ;; esac ;;
         -c|--cron)
@@ -168,6 +185,9 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 [ "$cron_requested" = no ] || [ "$mode" = sync ] || [ "$mode" = install ] || fail '-c cannot be combined with this operation.'
+if [ -n "$root_password" ] && [ "$mode" != sync ] && [ "$mode" != install ]; then
+    fail '-p cannot be combined with this operation.'
+fi
 [ "$trust_options" = no ] || [ "$mode" = install ] || [ "$mode" = keys ] || [ "$mode" = sync ] || fail 'Trust and URL settings require explicit installation or keys-only enrollment.'
 case $requested_verification in ''|on|off) : ;; *) fail '--gpg-verification requires on or off.' ;; esac
 [ "$download_script" = no ] || [ "$mode" = install ] || fail '--download-script requires --install.'
@@ -176,6 +196,7 @@ case $requested_verification in ''|on|off) : ;; *) fail '--gpg-verification requ
 need() { command -v "$1" >/dev/null 2>&1 || fail "Missing dependency: $1. Install it explicitly before continuing."; }
 for dep in awk cat chmod cmp cp dd grep id mkdir mktemp mv od rm rmdir sed stat tail tr wc; do need "$dep"; done
 uid=$(id -u)
+if [ -n "$root_password" ] && [ "$uid" != 0 ]; then fail '-p requires root.'; fi
 # Reject paths that could alter line-based cron records. Spaces and quotes are safe.
 case ${HOME:-} in /*) : ;; *) fail 'HOME must be an absolute directory.' ;; esac
 [ "$(printf '%s' "$HOME" | tr -d '\040-\176\200-\377'; printf .)" = . ] || fail 'HOME must not contain control characters.'
@@ -190,6 +211,8 @@ local_config=$state/local.conf
 replay_state=$state/replay.state
 pending_bundle=$state/pending.bundle
 pending_state=$state/pending.state
+pending_source=$state/pending.source
+audit_dir=$state/audit
 
 # GNU/Linux and BSD/macOS stat. No filesystem changes precede ownership checks.
 if stat -c '%u %a %h' "$HOME" >/dev/null 2>&1; then
@@ -224,6 +247,7 @@ check_path "$local_config" file
 check_path "$replay_state" file
 check_path "$pending_bundle" file
 check_path "$pending_state" file
+check_path "$pending_source" file
 
 validate_cron() {
     printf '%s\n' "$1" | awk '
@@ -387,6 +411,68 @@ install_script() {
     say 'Installed local script. Scheduled runs update keys only.'
 }
 
+sshd_present() { command -v sshd >/dev/null 2>&1; }
+cron_present() { command -v crontab >/dev/null 2>&1; }
+ssh_client_present() { command -v ssh-keygen >/dev/null 2>&1; }
+select_package_manager() {
+    if command -v apt-get >/dev/null 2>&1; then package_manager=apt-get
+    elif command -v dnf >/dev/null 2>&1; then package_manager=dnf
+    elif command -v yum >/dev/null 2>&1; then package_manager=yum
+    else fail 'No supported package manager (apt-get, dnf or yum); install the missing dependency explicitly.'; fi
+}
+install_dependency() {
+    [ "$uid" = 0 ] || fail 'Missing system dependency requires root; no privilege escalation is attempted.'
+    select_package_manager
+    case "$1:$package_manager" in
+        client:apt-get) package=openssh-client ;;
+        client:*) package=openssh-clients ;;
+        server:*) package=openssh-server ;;
+        cron:apt-get) package=cron ;;
+        cron:*) package=crontabs ;;
+        *) fail 'Unknown dependency request.' ;;
+    esac
+    if [ "$dry_run" = yes ]; then say "Would install $package using $package_manager."; return; fi
+    say "Installing missing dependency $package using $package_manager. Package hooks may start services or generate host keys; this script never reloads sshd."
+    case $package_manager in
+        apt-get)
+            if [ "$apt_index_updated" = no ]; then
+                apt-get update || fail 'Package index update failed. No managed key/policy writes were attempted; package metadata may have changed.'
+                apt_index_updated=yes
+            fi
+            apt-get install -y "$package" || fail 'Package installation failed or was partial. No managed key/policy writes were attempted; inspect package state before retrying.' ;;
+        dnf) dnf install -y "$package" || fail 'Package installation failed or was partial; inspect dnf before retrying.' ;;
+        yum) yum install -y "$package" || fail 'Package installation failed or was partial; inspect yum before retrying.' ;;
+    esac
+}
+ensure_ssh_client() {
+    if ssh_client_present; then return; fi
+    if [ "$mode" = keys ] || [ "$no_install" = yes ] || [ "$uid" != 0 ]; then
+        fail 'Missing ssh-keygen: install OpenSSH client tools explicitly (keys-only, -n and non-root runs never bootstrap packages).'
+    fi
+    install_dependency client
+    if [ "$dry_run" = yes ]; then fail 'Cannot validate keys in a dry run without ssh-keygen; install the client dependency before retrying.'; fi
+    ssh_client_present || fail 'OpenSSH client package completed but ssh-keygen is still unavailable; check PATH and package status.'
+}
+ensure_sshd() {
+    if [ "$no_install" = yes ]; then say 'SSHD installation/check skipped (-n).'; return; fi
+    if ! sshd_present; then
+        [ "$uid" = 0 ] || fail 'SSHD is not installed and this is a non-root run. Ask an administrator to install it, or use -o for keys only.'
+        install_dependency server
+        if [ "$dry_run" = yes ]; then return; fi
+        sshd_present || fail 'Server package completed but sshd is still unavailable; check PATH and package status.'
+    fi
+    if [ "$uid" = 0 ]; then
+        sshd -T >/dev/null 2>&1 || fail 'SSHD exists but its configuration cannot be evaluated (invalid configuration or permissions). No reinstall was attempted; inspect sshd -T.'
+    fi
+}
+ensure_cron() {
+    if cron_present; then return; fi
+    [ "$uid" = 0 ] || fail 'crontab is missing and this is a non-root run; ask an administrator to install cron.'
+    install_dependency cron
+    if [ "$dry_run" = yes ]; then return; fi
+    cron_present || fail 'Cron package completed but crontab is still unavailable; check PATH and package status.'
+}
+
 # Rewrite only an exact paired managed block or the exact known legacy command.
 # Unexpected cron errors and ambiguous/malformed managed entries fail closed.
 prepare_cron() {
@@ -500,7 +586,7 @@ validate_payload() {
         esac
     done < "$payload"
 }
-apply_payload() {
+prepare_authorized_keys() {
     [ -d "$ssh_dir" ] || { mkdir "$ssh_dir"; created_ssh=yes; }
     # Existing secure directory permissions need not be changed in dry-run mode.
     if [ "$dry_run" = no ]; then chmod 700 "$ssh_dir"; fi
@@ -552,6 +638,11 @@ apply_payload() {
     fi
     check_path "$auth_file" file
     check_expected_file "$auth_file" "$auth_snapshot"
+    auth_prepared=yes
+}
+commit_authorized_keys() {
+    check_path "$auth_file" file
+    check_expected_file "$auth_file" "$auth_snapshot"
     if [ "$auth_snapshot" != absent ] && cmp -s "$auth_snapshot" "$new_auth"; then
         if [ "$dry_run" = no ]; then chmod 600 "$auth_file"; fi
         say "Keys unchanged ($key_count keys, revision $revision)."
@@ -561,28 +652,92 @@ apply_payload() {
     fi
 }
 
-edit_sshd_config() {
+apply_payload() {
+    if [ "$auth_prepared" = no ]; then prepare_authorized_keys; fi
+    if [ "$policy" = off ]; then invalidate_audit_current; fi
+    commit_authorized_keys
+}
+
+# Support the standard global drop-in directory only. Never evaluate arbitrary
+# Include globs from configuration or assume a handful of Match contexts suffice.
+inspect_config_directives() {
+    awk -v allow="$2" -v standard="$include_dir/*.conf" '
+    function directive(line, name) {
+      sub(/^[[:space:]]*/,"",line)
+      if(substr(line,1,1)=="#") return ""
+      name=line
+      if(substr(name,1,1)=="\"") {name=substr(name,2);sub(/\".*$/,"",name)}
+      else sub(/[[:space:]=].*$/,"",name)
+      return tolower(name)
+    }
+    {
+      name=directive($0)
+      if(name=="match") exit 1
+      if(name=="include") {
+        if(allow!="yes") exit 1
+        line=$0; sub(/^[[:space:]]*/,"",line)
+        token=line; sub(/[[:space:]].*$/,"",token)
+        if(tolower(token)!="include") exit 1
+        sub(/^[^[:space:]]+[[:space:]]+/,"",line)
+        sub(/[[:space:]]+#.*$/,"",line); sub(/[[:space:]]*$/,"",line)
+        if(line!=standard && line!="sshd_config.d/*.conf") exit 1
+        includes=1
+      }
+    }
+    END {if(includes) print "yes"}
+    ' "$1"
+}
+list_standard_includes() {
+    : > "$1"
+    check_path "$include_dir" dir
+    if [ -d "$include_dir" ]; then
+        for include_file in "$include_dir"/*.conf; do
+            if [ ! -e "$include_file" ] && [ ! -L "$include_file" ]; then continue; fi
+            check_path "$include_file" file
+            [ "$(printf '%s' "$include_file" | tr -d '\040-\176\200-\377'; printf .)" = . ] || fail 'Unsupported control character in SSH drop-in filename.'
+            printf '%s\n' "$include_file" >> "$1"
+        done
+    fi
+}
+snapshot_standard_includes() {
+    new_temp "$state"; include_inventory=$TEMP
+    list_standard_includes "$include_inventory"
+    if [ -d "$include_dir" ]; then include_directory_state=present; else include_directory_state=absent; fi
+    new_temp "$state"; include_snapshots=$TEMP
+    while IFS= read -r include_file; do
+        new_temp "$state"; include_snapshot=$TEMP
+        cp "$include_file" "$include_snapshot"
+        inspect_config_directives "$include_snapshot" no >/dev/null || fail 'SSH drop-ins contain Match or nested Include; review root-login policy manually.'
+        printf '%s\t%s\n' "$include_file" "$include_snapshot" >> "$include_snapshots"
+    done < "$include_inventory"
+}
+check_standard_includes() {
+    new_temp "$state"; checked_inventory=$TEMP
+    list_standard_includes "$checked_inventory"
+    if [ "$include_directory_state" = absent ] && [ -d "$include_dir" ]; then fail 'SSH drop-in directory appeared concurrently; retry after reviewing it.'; fi
+    if [ "$include_directory_state" = present ] && [ ! -d "$include_dir" ]; then fail 'SSH drop-in directory disappeared concurrently; retry after reviewing it.'; fi
+    cmp -s "$include_inventory" "$checked_inventory" || fail 'SSH drop-in filename inventory changed concurrently; retry after reviewing it.'
+    tab=$(printf '\t')
+    while IFS="$tab" read -r include_file include_snapshot; do
+        check_path "$include_file" file
+        check_expected_file "$include_file" "$include_snapshot"
+    done < "$include_snapshots"
+}
+
+prepare_sshd_config() {
     [ "$uid" = 0 ] || fail '-p requires root.'
     need sshd
     config=/etc/ssh/sshd_config
     check_path /etc/ssh dir
     check_path "$config" file
     [ -f "$config" ] || fail 'sshd_config does not exist; install/configure sshd yourself first.'
-    new_temp /etc/ssh; config_snapshot=$TEMP
-    cp "$config" "$config_snapshot"
-    # Editing a global directive cannot reliably predict Include/Match overrides.
-    if awk '
-        { name=$0; sub(/^[[:space:]]*/,"",name)
-          if(substr(name,1,1)=="\"") { name=substr(name,2); sub(/\".*$/,"",name) }
-          else sub(/[[:space:]=].*$/,"",name)
-          name=tolower(name); if(name=="include" || name=="match") { found=1; exit }
-        }
-        END { exit !found }
-    ' "$config_snapshot"; then
-        fail 'sshd_config uses Include or Match. Review and change root-login policy manually; nothing changed.'
-    fi
+    new_temp /etc/ssh; sshd_snapshot=$TEMP
+    cp "$config" "$sshd_snapshot"
+    include_dir=/etc/ssh/sshd_config.d
+    allowed_includes=$(inspect_config_directives "$sshd_snapshot" yes) || fail 'sshd_config uses Match or an unsupported Include. Only the standard sshd_config.d/*.conf global include is supported; review other layouts manually.'
+    if [ "$allowed_includes" = yes ]; then snapshot_standard_includes; fi
     sshd -t -f "$config" || fail 'Existing sshd_config is invalid.'
-    new_temp /etc/ssh; config_tmp=$TEMP
+    new_temp /etc/ssh; sshd_staged=$TEMP
     if [ "$root_password" = yes ]; then setting=yes; else setting=prohibit-password; fi
     awk -v value="$setting" '
     BEGIN { print "PermitRootLogin " value }
@@ -591,13 +746,17 @@ edit_sshd_config() {
       else sub(/[[:space:]=].*$/,"",name)
       if(tolower(name)!="permitrootlogin") print
     }
-    ' "$config_snapshot" > "$config_tmp"
-    sshd -t -f "$config_tmp" || fail 'Staged sshd_config failed validation.'
+    ' "$sshd_snapshot" > "$sshd_staged"
+    sshd -t -f "$sshd_staged" || fail 'Staged sshd_config failed validation.'
     new_temp "$state"; effective=$TEMP
-    sshd -T -f "$config_tmp" > "$effective" || fail 'Cannot evaluate staged sshd_config.'
+    sshd -T -f "$sshd_staged" > "$effective" || fail 'Cannot evaluate staged sshd_config.'
     actual=$(awk '$1=="permitrootlogin" {print $2}' "$effective")
     case "$setting:$actual" in yes:yes|prohibit-password:prohibit-password|prohibit-password:without-password) : ;; *) fail 'Effective root-login policy does not match the requested setting.' ;; esac
-    replace_file "$config" "$config_tmp" 600 "$config_snapshot"
+    if [ "$allowed_includes" = yes ]; then check_standard_includes; fi
+}
+commit_sshd_config() {
+    if [ "$allowed_includes" = yes ]; then check_standard_includes; fi
+    replace_file "$config" "$sshd_staged" 600 "$sshd_snapshot"
     say 'Root-login policy validated. No service reload was performed; test recovery access before applying it.'
     [ "$root_password" != yes ] || say 'PermitRootLogin yes does not enable PasswordAuthentication if it is disabled elsewhere.'
 }
@@ -606,7 +765,7 @@ edit_sshd_config() {
 validate_url() {
     [ "${#1}" -le 2048 ] || return 1
     printf '%s\n' "$1" | grep -Eq '^https://([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?(/[!-~]*)?$' || return 1
-    case $1 in *'?'*|*'#'*|*'\'*) return 1 ;; esac
+    case $1 in *'?'*|*'#'*|*\\*) return 1 ;; esac
 }
 strict_text() {
     last_lf "$1" || fail 'Local data must end with LF.'
@@ -662,7 +821,7 @@ hkps://keyserver.ubuntu.com"
     fi
     validate_urls "$urls"
     validate_discovery_settings
-    if [ "$policy" = required ] && [ "$mode" != uninstall ] && [ "$mode" != config ] && [ "$cron_value" != false ] && [ "$requested_verification" != off ]; then
+    if [ "$policy" = required ] && [ "$mode" != uninstall ] && [ "$cron_value" != false ] && [ "$requested_verification" != off ]; then
         trust_key=$state/trust-$pinned_fingerprint-$pin_mode.asc
         check_path "$trust_key" file
         [ -f "$trust_key" ] || [ "$mode" = install ] || [ "$trust_options" = yes ] || fail 'Dedicated pinned certificate is missing; reinstall explicitly to recover it.'
@@ -708,7 +867,8 @@ $key_description.primary"
 }
 validate_discovery_settings() {
     if [ "$gpg_email" != - ]; then
-        [ "${#gpg_email}" -le 254 ] && printf '%s\n' "$gpg_email" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$' || fail 'Invalid WKD email address.'
+        if [ "${#gpg_email}" -le 254 ] && printf '%s\n' "$gpg_email" | grep -Eq '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$'; then :
+        else fail 'Invalid WKD email address.'; fi
     fi
     new_temp "$state"; server_list=$TEMP
     printf '%s\n' "$keyservers" > "$server_list"
@@ -731,11 +891,12 @@ accept_certificate_candidate() {
     # or a rejected certificate from contaminating the final verifier.
     reset_gpg_home
     new_temp "$state"; candidate_export=$TEMP
-    if ( lock_owned=no; created_state=no; created_ssh=no; temps=;
+    if ( lock_owned=no; created_state=no; created_ssh=no; temps=; candidate_result=0
          trap 'candidate_result=$?; gpg_home=; cleanup "$candidate_result"' 0
          import_pinned_key "$1"
          gpg_local --armor --export "$certificate_primary" > "$candidate_export" || fail 'Candidate certificate cannot be exported by this GnuPG version.'
-         [ -s "$candidate_export" ] && [ "$(wc -c < "$candidate_export" | tr -d ' ')" -le 1048576 ] || fail 'Candidate public certificate export is empty or oversized.' ); then
+         if [ -s "$candidate_export" ] && [ "$(wc -c < "$candidate_export" | tr -d ' ')" -le 1048576 ]; then :
+         else fail 'Candidate public certificate export is empty or oversized.'; fi ); then
         import_pinned_key "$candidate_export"
         staged_trust=$candidate_export
         trust_key=$state/trust-$pinned_fingerprint-$pin_mode.asc
@@ -867,7 +1028,9 @@ prepare_install_config() {
             requested_fingerprint=${requested_fingerprint:-$old_pin}
             requested_list_id=${requested_list_id:-$old_list}
         fi
-        [ -n "$requested_fingerprint" ] && [ -n "$requested_list_id" ] || fail 'Enabling verification requires --gpg-fingerprint and --list-id (or configured defaults).'
+        if [ -z "$requested_fingerprint" ] || [ -z "$requested_list_id" ]; then
+            fail 'Enabling verification requires --gpg-fingerprint and --list-id (or configured defaults).'
+        fi
         requested_pin_mode=${requested_pin_mode:-$pin_mode}
         case $requested_pin_mode in primary|subkey) : ;; *) fail '--gpg-pin-mode must be primary or subkey.' ;; esac
         requested_fingerprint=$(printf '%s' "$requested_fingerprint" | tr 'a-f' 'A-F')
@@ -887,7 +1050,8 @@ prepare_install_config() {
         discover_certificate
         if [ "$old_pin" != - ] && [ -n "$requested_min_sequence" ]; then
             floor=$requested_min_sequence
-            printf '%s\n' "$floor" | grep -Eq '^[1-9][0-9]{0,9}$' && [ "$floor" -le 2147483647 ] || fail 'Minimum sequence must be 1..2147483647.'
+            if printf '%s\n' "$floor" | grep -Eq '^[1-9][0-9]{0,9}$' && [ "$floor" -le 2147483647 ]; then :
+            else fail 'Minimum sequence must be 1..2147483647.'; fi
             new_temp "$state"; replay_snapshot=$TEMP
             cp "$replay_state" "$replay_snapshot"
             read_replay_state "$replay_snapshot"
@@ -897,9 +1061,12 @@ prepare_install_config() {
             else cp "$replay_snapshot" "$staged_replay"; fi
         fi
         if [ "$old_pin" = - ]; then
-            [ ! -e "$replay_state" ] && [ ! -e "$pending_state" ] && [ ! -e "$pending_bundle" ] || fail 'Existing security state requires manual recovery; cannot silently enroll over it.'
+            if [ -e "$replay_state" ] || [ -e "$pending_state" ] || [ -e "$pending_bundle" ]; then
+                fail 'Existing security state requires manual recovery; cannot silently enroll over it.'
+            fi
             floor=${requested_min_sequence:-1}
-            printf '%s\n' "$floor" | grep -Eq '^[1-9][0-9]{0,9}$' && [ "$floor" -le 2147483647 ] || fail 'Minimum sequence must be 1..2147483647.'
+            if printf '%s\n' "$floor" | grep -Eq '^[1-9][0-9]{0,9}$' && [ "$floor" -le 2147483647 ]; then :
+            else fail 'Minimum sequence must be 1..2147483647.'; fi
             new_temp "$state"; staged_replay=$TEMP
             write_replay_record "$((floor - 1))" - "$staged_replay"
         fi
@@ -968,7 +1135,8 @@ validate_signed_document() {
         [ "$release_list" = "$list_id" ] || fail 'Signed list identity does not match local enrollment.'
         now=$(date +%s)
         if [ "$enforce_freshness" = yes ]; then
-            [ "$issued_at" -le "$((now + 300))" ] && [ "$expires_at" -gt "$now" ] || fail 'Signed release is expired or issued too far in the future.'
+            if [ "$issued_at" -le "$((now + 300))" ] && [ "$expires_at" -gt "$now" ]; then :
+            else fail 'Signed release is expired or issued too far in the future.'; fi
         fi
     fi
     digest=$(sha256 "$response")
@@ -995,6 +1163,8 @@ verify_signature() {
       if($5 !~ /^(0|[1-9][0-9]*)$/ || length($5)>10 || $5+0>now+300 || $6 !~ /^(0|[1-9][0-9]*)$/ || length($6)>10 || ($6!=0 && $6+0<=now)) bad=1 }
     END {if(bad || good!=1) exit 1}
     ' "$gpg_status" || fail 'Signature status lacks one valid, unexpired signature from the locally pinned primary/subkey.'
+    actual_signer=$(awk '$2=="VALIDSIG" {print $3}' "$gpg_status")
+    actual_primary=$(awk '$2=="VALIDSIG" {print $12}' "$gpg_status")
 }
 check_replay() {
     [ "$sequence" -ge "$recorded_sequence" ] || fail 'Signed sequence rollback rejected.'
@@ -1032,7 +1202,124 @@ read_pending_bundle() {
     make_pending_bundle "$rebuilt"
     cmp -s "$rebuilt" "$pending_bundle" || fail 'Noncanonical pending package.'
 }
+check_audit_paths() {
+    check_path "$audit_dir" dir
+    check_path "$audit_dir/current" file
+    check_path "$audit_dir/previous" file
+    for audit_slot_name in a b; do
+        check_path "$audit_dir/$audit_slot_name" dir
+        for audit_name in ssh.keys ssh.keys.sig metadata; do
+            check_path "$audit_dir/$audit_slot_name/$audit_name" file
+        done
+    done
+}
+read_audit_pointer() {
+    pointer_slot=
+    pointer_snapshot=absent
+    if [ -f "$1" ]; then
+        new_temp "$state"; pointer_snapshot=$TEMP
+        cp "$1" "$pointer_snapshot"
+        [ "$(wc -c < "$pointer_snapshot" | tr -d ' ')" = 34 ] || fail 'Malformed audit pointer.'
+        awk 'NR==1 {if($0!="conf-sshd-audit-pointer-v1") exit 1} NR==2 {if($0!="slot a" && $0!="slot b") exit 1} END {if(NR!=2) exit 1}' "$pointer_snapshot" || fail 'Malformed audit pointer.'
+        last_lf "$pointer_snapshot" || fail 'Malformed audit pointer ending.'
+        pointer_slot=$(sed -n '2s/^slot //p' "$pointer_snapshot")
+    fi
+}
+audit_replace() {
+    check_path "$1" file
+    chmod 600 "$2"
+    mv -f "$2" "$1"
+}
+audit_pointer() {
+    new_temp "$audit_dir"; new_pointer=$TEMP
+    printf 'conf-sshd-audit-pointer-v1\nslot %s\n' "$2" > "$new_pointer"
+    audit_replace "$1" "$new_pointer"
+}
+prepare_audit_slot() {
+    check_audit_paths
+    if [ "$dry_run" = yes ]; then return; fi
+    [ -d "$audit_dir" ] || mkdir "$audit_dir"
+    chmod 700 "$audit_dir"
+    read_audit_pointer "$audit_dir/current"
+    audit_old_current=$pointer_slot
+    audit_current_snapshot=$pointer_snapshot
+    read_audit_pointer "$audit_dir/previous"
+    audit_old_previous=$pointer_slot
+    audit_previous_snapshot=$pointer_snapshot
+    audit_base=${audit_old_current:-$audit_old_previous}
+    if [ "$audit_base" = a ]; then audit_slot=b; else audit_slot=a; fi
+    # This slot is about to be reused; stop advertising it as history first.
+    if [ "$audit_old_previous" = "$audit_slot" ]; then
+        check_expected_file "$audit_dir/previous" "$audit_previous_snapshot"
+        rm -f "$audit_dir/previous"
+        audit_previous_snapshot=absent
+    fi
+    [ -d "$audit_dir/$audit_slot" ] || mkdir "$audit_dir/$audit_slot"
+    chmod 700 "$audit_dir/$audit_slot"
+    new_temp "$audit_dir/$audit_slot"; audit_document=$TEMP
+    cp "$response" "$audit_document"
+    new_temp "$audit_dir/$audit_slot"; audit_signature=$TEMP
+    cp "$signature" "$audit_signature"
+    audit_replace "$audit_dir/$audit_slot/ssh.keys" "$audit_document"
+    audit_replace "$audit_dir/$audit_slot/ssh.keys.sig" "$audit_signature"
+}
+invalidate_audit_current() {
+    if [ "$dry_run" = yes ]; then return; fi
+    check_audit_paths
+    [ -d "$audit_dir" ] || return 0
+    if [ "$policy" != required ]; then
+        read_audit_pointer "$audit_dir/current"
+        audit_old_current=$pointer_slot
+        audit_current_snapshot=$pointer_snapshot
+        read_audit_pointer "$audit_dir/previous"
+        audit_previous_snapshot=$pointer_snapshot
+    fi
+    check_expected_file "$audit_dir/current" "$audit_current_snapshot"
+    check_expected_file "$audit_dir/previous" "$audit_previous_snapshot"
+    if [ -n "$audit_old_current" ]; then
+        audit_pointer "$audit_dir/previous" "$audit_old_current"
+        rm -f "$audit_dir/current"
+    fi
+}
+publish_audit_slot() {
+    if [ "$dry_run" = yes ]; then say 'Would publish the verified original key document and detached signature to the bounded local audit.'; return; fi
+    check_audit_paths
+    if cmp -s "$response" "$audit_dir/$audit_slot/ssh.keys" && cmp -s "$signature" "$audit_dir/$audit_slot/ssh.keys.sig"; then :
+    else fail 'Audit staging changed; current audit remains uncommitted.'; fi
+    new_temp "$audit_dir/$audit_slot"; audit_metadata=$TEMP
+    printf 'conf-sshd-audit-v1\ninstalled-at %s\nclient-version conf-sshd-client-security-v1\nlist-id %s\nsequence %s\nsource %s\nsigner-fingerprint %s\nprimary-fingerprint %s\npin-mode %s\npinned-fingerprint %s\ndocument-sha256 %s\nsignature-sha256 %s\n' \
+        "$(date +%s)" "$list_id" "$sequence" "$accepted_source" "$actual_signer" "$actual_primary" "$pin_mode" "$pinned_fingerprint" "$digest" "$(sha256 "$signature")" > "$audit_metadata"
+    audit_replace "$audit_dir/$audit_slot/metadata" "$audit_metadata"
+    check_expected_file "$audit_dir/current" absent
+    audit_pointer "$audit_dir/current" "$audit_slot"
+}
+write_pending_source() {
+    new_temp "$state"; source_record=$TEMP
+    printf 'conf-sshd-pending-source-v1\nsequence %s\ndocument-sha256 %s\nsignature-sha256 %s\nsource %s\n' \
+        "$sequence" "$digest" "$(sha256 "$signature")" "$accepted_source" > "$source_record"
+    replace_file "$pending_source" "$source_record" 600
+}
+read_pending_source() {
+    accepted_source=local-pending:original-source-unavailable
+    if [ ! -f "$pending_source" ]; then return; fi
+    [ "$(wc -c < "$pending_source" | tr -d ' ')" -le 2400 ] || fail 'Pending source context is oversized.'
+    strict_text "$pending_source"
+    awk -v seq="$sequence" -v doc="$digest" -v sig="$(sha256 "$signature")" '
+    NR==1 {if($0!="conf-sshd-pending-source-v1") exit 1}
+    NR==2 {if($0!="sequence " seq) exit 1}
+    NR==3 {if($0!="document-sha256 " doc) exit 1}
+    NR==4 {if($0!="signature-sha256 " sig) exit 1}
+    NR==5 {if(substr($0,1,7)!="source " || length($0)<8) exit 1}
+    END {if(NR!=5) exit 1}
+    ' "$pending_source" || fail 'Pending source context does not match its exact verified package.'
+    accepted_source=$(sed -n '5s/^source //p' "$pending_source")
+    if [ "$accepted_source" != local-pending:original-source-unavailable ]; then
+        validate_url "$accepted_source" || fail 'Pending audit source is not a configured-format HTTPS URL.'
+    fi
+}
+
 finish_verified_release() {
+    if [ "$auth_prepared" = no ]; then prepare_authorized_keys; fi
     # Commit a complete verified package before advancing any anti-rollback state
     # or replacing keys. Atomic renames survive process interruption, not every
     # power-loss/filesystem failure; no portable fsync promise is made here.
@@ -1043,24 +1330,28 @@ finish_verified_release() {
             new_temp "$state"; promoted_state=$TEMP
             write_replay_record "$recorded_sequence" "$recorded_digest" "$promoted_state"
             replace_file "$replay_state" "$promoted_state" 600
-            rm -f "$pending_state" "$pending_bundle"
+            rm -f "$pending_state" "$pending_bundle" "$pending_source"
         fi
         if [ ! -f "$pending_state" ]; then
             new_temp "$state"; pending_tmp=$TEMP
             make_pending_bundle "$pending_tmp"
             replace_file "$pending_bundle" "$pending_tmp" 600
+            write_pending_source
             new_temp "$state"; pending_record=$TEMP
             write_replay_record "$sequence" "$digest" "$pending_record"
             replace_file "$pending_state" "$pending_record" 600 absent
         fi
     fi
-    apply_payload
+    prepare_audit_slot
+    invalidate_audit_current
+    commit_authorized_keys
     if [ "$dry_run" = no ]; then
         new_temp "$state"; final_state=$TEMP
         write_replay_record "$sequence" "$digest" "$final_state"
         replace_file "$replay_state" "$final_state" 600
-        rm -f "$pending_state" "$pending_bundle"
-    fi
+        publish_audit_slot
+        rm -f "$pending_state" "$pending_bundle" "$pending_source"
+    else publish_audit_slot; fi
 }
 sync_keys() {
     need ssh-keygen
@@ -1094,16 +1385,21 @@ sync_keys() {
                 enforce_freshness=yes
                 check_replay
                 if [ -n "$pending_sequence" ]; then
-                    [ "$sequence" = "$pending_sequence" ] && [ "$digest" = "$pending_digest" ] || fail 'Pending package does not match its rollback record.'
+                    if [ "$sequence" != "$pending_sequence" ] || [ "$digest" != "$pending_digest" ]; then
+                        fail 'Pending package does not match its rollback record.'
+                    fi
                 elif [ "$sequence" = "$recorded_sequence" ] && [ "$digest" = "$recorded_digest" ]; then
                     # Crash while removing an old journal after promoting its
                     # floor: committed state already authenticates these bytes.
                     pending_sequence=$sequence
                     pending_digest=$digest
                 fi
-                if ( lock_owned=no; created_state=no; created_ssh=no; temps=;
+                if ( lock_owned=no; created_state=no; created_ssh=no; temps=; child_result=0
                      trap 'child_result=$?; gpg_home=; cleanup "$child_result"' 0
                      validate_response ); then
+                    # Subshell checks do not propagate machine-status fields.
+                    verify_signature
+                    read_pending_source
                     if [ "$validation_only" = no ]; then
                         finish_verified_release
                         say 'Recovered the same verified pending release; no fallback was fetched.'
@@ -1135,11 +1431,11 @@ sync_keys() {
                 say "Signature unavailable from $source_url; trying next locally configured source." >&2
                 continue
             fi
-            if ( lock_owned=no; created_state=no; created_ssh=no; gpg_home_saved=$gpg_home; gpg_home=; temps=;
+            if ( lock_owned=no; created_state=no; created_ssh=no; gpg_home_saved=$gpg_home; gpg_home=; temps=; child_result=0
                  # Preserve the caller keyring but never delete it in this subshell.
                  gpg_home=$gpg_home_saved
                  trap 'child_result=$?; gpg_home=; cleanup "$child_result"' 0
-                 validate_response ); then accepted=yes; break; fi
+                 validate_response ); then accepted=yes; accepted_source=$source_url; break; fi
         fi
         say "Rejected source $source_url; trying next locally configured source." >&2
     done < "$urls"
@@ -1150,56 +1446,54 @@ sync_keys() {
     fi
 }
 
-if [ "$mode" = uninstall ] || [ "$mode" = config ] || { [ "$mode" = sync ] && [ "$cron_requested" = yes ] && [ "$cron_value" = false ]; }; then
+if [ "$mode" = uninstall ] || { [ "$mode" = sync ] && [ "$cron_requested" = yes ] && [ "$cron_value" = false ] && [ -z "$root_password" ]; }; then
     policy=off
     config_snapshot=absent
 else load_local_config; fi
 case $mode in
-    install)
-        validate_build
-        prepare_install_config
-        prepare_script
-        if [ "$cron_requested" = yes ]; then
-            prepare_cron
-            if [ -z "$cron_value" ]; then cron_value=${existing_schedule:-$DEFAULT_CRON}; fi
-        fi
-        validation_only=yes
-        sync_keys
-        # Activate policy only after replacing any legacy scheduled executable.
-        install_script
-        commit_install_config
-        if [ "$policy" = required ]; then finish_verified_release; else apply_payload; fi
-        if [ "$cron_requested" = yes ]; then apply_cron "$cron_value"; fi ;;
     uninstall)
-        if command -v crontab >/dev/null 2>&1; then prepare_cron; apply_cron false; fi
+        if cron_present; then prepare_cron; apply_cron false; fi
         for uninstall_file in "$target_script" "$target_script.conf-sshd.bak"; do
             check_path "$uninstall_file" file
             if [ "$dry_run" = yes ]; then say "Would remove $uninstall_file"; else rm -f "$uninstall_file"; fi
         done
         say 'Uninstalled managed scheduling/script. Authorized keys, trust and rollback state are preserved.' ;;
-    config) edit_sshd_config ;;
-    sync|keys)
+    sync|keys|install)
         script_tmp=
-        if [ "$cron_requested" = yes ]; then
-            prepare_cron
-            if [ "$cron_value" = false ]; then apply_cron false; exit 0; fi
-            validate_build
-            if [ -z "$cron_value" ]; then cron_value=${existing_schedule:-$DEFAULT_CRON}; fi
+        if [ "$mode" = sync ] && [ "$cron_requested" = yes ] && [ "$cron_value" = false ] && [ -z "$root_password" ]; then
+            if cron_present; then prepare_cron; apply_cron false
+            else say 'crontab is not installed; no managed schedule was changed.'; fi
+            exit 0
         fi
-        if [ "$trust_options" = yes ] || { [ "$config_snapshot" = absent ] && [ "$DEFAULT_GPG_VERIFY" = on ]; }; then
-            validate_build
+        validate_build
+        if [ "$mode" = install ] || [ "$trust_options" = yes ] || { [ "$config_snapshot" = absent ] && [ "$DEFAULT_GPG_VERIFY" = on ]; }; then
             prepare_install_config
-            validation_only=yes
         fi
-        if [ "$cron_requested" = yes ] && [ ! -f "$target_script" ]; then prepare_script; fi
+        if [ "$mode" = install ] || { [ "$cron_requested" = yes ] && [ "$cron_value" != false ] && [ ! -f "$target_script" ]; }; then
+            prepare_script
+        fi
+        # Only client prerequisites may bootstrap before key verification. Trust
+        # consent has already happened; daemon/config/key writes remain staged.
+        ensure_ssh_client
+        validation_only=yes
         sync_keys
-        if [ "$config_prepared" = yes ]; then
-            if [ -n "$script_tmp" ]; then install_script; script_tmp=; fi
-            commit_install_config
-            if [ "$policy" = required ]; then finish_verified_release; else apply_payload; fi
-        fi
+        prepare_authorized_keys
+        if [ "$mode" != keys ]; then ensure_sshd; fi
         if [ "$cron_requested" = yes ]; then
-            if [ -n "$script_tmp" ]; then install_script; fi
-            apply_cron "$cron_value"
-        fi ;;
+            if [ "$cron_value" != false ]; then ensure_cron; fi
+            if cron_present; then
+                prepare_cron
+                cron_prepared=yes
+                if [ -z "$cron_value" ]; then cron_value=${existing_schedule:-$DEFAULT_CRON}; fi
+            elif [ "$dry_run" = yes ]; then
+                say 'Would inspect the existing crontab and configure scheduling after cron is installed.'
+            fi
+        fi
+        if [ -n "$root_password" ]; then prepare_sshd_config; fi
+        # Activate policy only after replacing any legacy scheduled executable.
+        if [ -n "$script_tmp" ]; then install_script; fi
+        if [ "$config_prepared" = yes ]; then commit_install_config; fi
+        if [ "$policy" = required ]; then finish_verified_release; else apply_payload; fi
+        if [ -n "$root_password" ]; then commit_sshd_config; fi
+        if [ "$cron_prepared" = yes ]; then apply_cron "$cron_value"; fi ;;
 esac

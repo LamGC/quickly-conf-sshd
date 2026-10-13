@@ -81,6 +81,7 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
           await page.goto(fixture.origin + "/repository");
           await page.waitForSelector("html.enhanced");
           await noPageOverflow(page, width);
+          assert.deepEqual(await page.locator("main > section.content-section").evaluateAll((sections) => sections.map((section) => section.id)), ["quick-start", "key-status", "signature", "paths"]);
           const install = fixture.snapshots.repository.commands.find((command) => command.id === "install").command;
           assert.equal(await page.locator("#command-install").textContent(), install);
           assert.equal(await page.locator(".key-card, [data-copy-target^='key-'], #copy-all-keys, #copy-all-commands").count(), 0);
@@ -136,6 +137,14 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
             await page.keyboard.press("Enter");
             await page.waitForFunction((id) => document.querySelector(`[data-copy-target="command-${id}"]`).dataset.state === "success", command.id);
             assert.equal(await page.evaluate(() => window.__clipboardTest.values.at(-1)), command.command);
+          }
+          for (const path of fixture.snapshots.repository.paths) {
+            assert.equal(await page.locator(`#path-${path.id}`).textContent(), path.url);
+            const button = page.locator(`[data-copy-target="path-${path.id}"]`);
+            await button.focus();
+            await page.keyboard.press("Enter");
+            await page.waitForFunction((id) => document.querySelector(`[data-copy-target="path-${id}"]`).dataset.state === "success", path.id);
+            assert.equal(await page.evaluate(() => window.__clipboardTest.values.at(-1)), path.url);
           }
           await noPageOverflow(page, width);
 
@@ -200,6 +209,10 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
           // Repository appearance is already captured in both viewports above: 12 screenshots in total.
           if (state !== "repository") await capture(page, "source-" + state);
         }
+        await page.goto(fixture.origin + "/signature-disabled");
+        assert.deepEqual(await page.locator("main > section.content-section").evaluateAll((sections) => sections.map((section) => section.id)), ["quick-start", "key-status", "paths"]);
+        assert.equal(await page.locator("#signature, #path-signature, #path-certificate").count(), 0, "runtime signature metadata must not enable the Signature section");
+        assert.equal(await page.locator("#path-root-script").textContent(), fixture.snapshots.repository.baseUrl + "/");
         assert.deepEqual(externalRequests, []);
       } finally { await context.close(); }
     });
@@ -214,6 +227,8 @@ test("real browser homepage integration", { skip: process.env.BROWSER_TESTS !== 
         assert.equal(await page.locator("#key-status").isVisible(), true);
         assert.equal(await page.locator(".key-card, [data-copy-target^='key-'], #copy-all-keys").count(), 0);
         assert.equal(await page.locator("#command-install").isVisible(), true);
+        assert.equal(await page.locator("#path-root-script").isVisible(), true);
+        assert.equal(await page.locator("#path-homepage").textContent(), fixture.snapshots.repository.baseUrl + "/");
         assert.equal(await page.locator('[data-copy-target="command-install"]').isVisible(), false);
         assert.equal(await page.locator("#theme-picker").isVisible(), false);
         assert.match(await page.locator("noscript").textContent(), /手动选择复制/);

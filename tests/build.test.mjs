@@ -37,7 +37,8 @@ test('empty revocation must be explicit; protocol is deterministic',async()=>{
 test('homepage excludes keys and commands use explicit install and fixed local sync',async()=>{
   const commands=commandsFor(config);
   assert.ok(commands.find(x=>x.id==='install').command.includes('--install'));
-  assert.ok(commands.find(x=>x.id==='root-on').advanced);
+  assert.equal(Boolean(commands.find(x=>x.id==='root-on').advanced), false);
+  assert.ok(commands.find(x=>x.id==='root-off').advanced);
   assert.ok(commandsFor({...config,defaultCron:'0 */6 * * *'})[0].description.includes('0 */6 * * *'));
   assert.ok(commands.find(x=>x.id==='uninstall').advanced);
   assert.ok(commands.every(x=>!x.command.includes('github.io')));

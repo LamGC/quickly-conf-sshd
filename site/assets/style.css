@@ -108,8 +108,8 @@ h1 { margin: 0; font-size: clamp(30px, 3.4vw, 42px); font-weight: 650; letter-sp
 .text-link span { margin-left: 4px; }
 .keys-notice { margin: 0 0 15px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--muted); font-size: 12px; }
 .keys-notice:empty { display: none; }
-.command-list { display: grid; gap: 14px; min-width: 0; }
-.command-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.command-list, .path-list { display: grid; gap: 14px; min-width: 0; }
+.command-list, .path-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .command-card { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
 .card-heading { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; min-width: 0; }
 .card-heading h3 { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 600; margin: 0; line-height: 1.65; }
@@ -203,7 +203,7 @@ dialog::backdrop { background: rgb(10 22 15 / 52%); }
   .section-actions { width: 100%; justify-content: space-between; }
   .commands-section > .section-heading > .text-link { margin-top: -3px; }
   .command-card { padding: 14px; }
-  .command-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .command-list, .path-list { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .card-heading { gap: 8px; }
   pre { padding-left: 12px; padding-block: 16px; }
   .copy-button { width: 40px; height: 40px; }

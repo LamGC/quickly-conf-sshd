@@ -98,7 +98,8 @@ else
     cp "$1" "$TEST_CRONTAB"
 fi
 ''')
-        for cmd in ('sshd', 'apt-get', 'yum', 'dnf', 'systemctl', 'service'):
+        self.mock('sshd', '#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = -T ]; then exit 0; fi\necho \"UNEXPECTED sshd $*\" >> \"$TEST_CALLS\"\nexit 98\n')
+        for cmd in ('apt-get', 'yum', 'dnf', 'systemctl', 'service'):
             self.mock(cmd, f'#!/bin/sh\necho "UNEXPECTED {cmd} $*" >> "$TEST_CALLS"\nexit 98\n')
 
     def tearDown(self):
@@ -130,7 +131,7 @@ fi
                 lines.append(f'{path.name}() {{ {shlex.quote(str(path))} "$@"; }}')
             # Hyphenated command names such as apt-get are not POSIX function
             # identifiers and have no BusyBox applets; their PATH mocks remain.
-        for name in ('id', 'crontab'):
+        for name in ('id', 'crontab', 'sshd', 'apt-get', 'dnf', 'yum'):
             lines.extend([
                 f'if [ "$({name} --conf-sshd-isolation-probe)" != conf-sshd-mock:{name} ]; then',
                 f'    printf \'%s\\n\' \'TEST ISOLATION FAILED: {name} mock was bypassed\' >&2',
@@ -180,7 +181,7 @@ fi
         subprocess.run([*SHELL, '-n', str(self.script)], check=True)
 
     def test_isolation_probe_aborts_before_installer_when_mock_is_bypassed(self):
-        for name in ('id', 'crontab'):
+        for name in ('id', 'crontab', 'sshd', 'apt-get', 'dnf', 'yum'):
             with self.subTest(name=name):
                 mock_path = self.bin / name
                 original = mock_path.read_text()
@@ -535,6 +536,7 @@ fi
         fixture = SCRIPT.replace('config=/etc/ssh/sshd_config', f"config='{config}'")
         fixture = fixture.replace('check_path /etc/ssh dir', f"check_path '{config_dir}' dir")
         fixture = fixture.replace('new_temp /etc/ssh;', f"new_temp '{config_dir}';")
+        fixture = fixture.replace('/etc/ssh', str(config_dir))
         self.assertNotIn('/etc/ssh', fixture, 'All root-policy paths must stay inside test fixtures')
         self.script.write_text(fixture)
         self.mock('id', '#!/bin/sh\nprintf "0\\n"\n')
@@ -544,6 +546,11 @@ fi
 printf 'sshd %s\\n' "$*" >> "$TEST_CALLS"
 operation=$1
 shift
+if [ "$#" = 0 ] && [ "$operation" = -T ]; then
+    [ "${TEST_DEFAULT_SSHD_FAIL:-0}" = 0 ] || exit 1
+    echo 'permitrootlogin no'
+    exit 0
+fi
 [ "$1" = -f ] || exit 90
 config=$2
 [ "${TEST_SSHD_FAIL:-}" != "$operation" ] || exit 1
@@ -616,13 +623,13 @@ fi
         self.assertTrue(config.read_text().startswith('PermitRootLogin yes\n'))
         self.assertIn('sshd -t -f', self.calls.read_text())
         self.assertIn('sshd -T -f', self.calls.read_text())
-        self.assertFalse(self.auth.exists())
+        self.assertEqual(self.auth.read_bytes(), BEGIN + KEY + END)
         self.assert_clean()
         self.assertEqual(list(config.parent.glob('.conf-sshd.*')), [])
 
     def test_root_policy_include_match_invalid_effective_and_dry_run(self):
         config = self.mock_root_config()
-        for text in ['Include sshd_config.d/*.conf\n', ' Match User test\n',
+        for text in ['Include other/*.conf\n', ' Match User test\n',
                      'Port 2222\nINCLUDE other\n', 'mAtCh all\n',
                      'Include=other\n', 'Match=User root\n', '"Include"=other\n',
                      '"Match" User root\n', '"Match"User root\n']:
@@ -732,6 +739,182 @@ fi
         self.assertFalse((self.home / '.conf-sshd').exists())
         self.script.write_text(SOURCE)
         self.run_script('-o', ok=False)
+        self.assertFalse(self.auth.exists())
+
+
+    def simulate_dependencies(self, *, manager='apt-get', uid='0', sshd=True, client=True, cron=True):
+        real_stat=shutil.which('stat')
+        self.mock('id',f'#!/bin/sh\nprintf "%s\\n" "{uid}"\n')
+        self.mock('stat',f'#!/bin/sh\n"{real_stat}" "$@" | sed \'s/^[0-9][0-9]*/{uid}/\'\n')
+        fixture=self.script.read_text()
+        for function,command,marker,present in [('sshd_present','sshd','sshd-ready',sshd),('cron_present','crontab','cron-ready',cron),('ssh_client_present','ssh-keygen','client-ready',client)]:
+            old=f'{function}() {{ command -v {command} >/dev/null 2>&1; }}'
+            new=f'{function}() {{ [ -f "$TEST_ROOT/{marker}" ]; }}'
+            self.assertIn(old,fixture)
+            fixture=fixture.replace(old,new)
+            path=self.root/marker
+            if present: path.touch()
+            elif path.exists(): path.unlink()
+        for tool in ('apt-get','dnf','yum'):
+            fixture=fixture.replace(f'command -v {tool} >/dev/null 2>&1',f'[ "$TEST_PACKAGE_MANAGER" = {tool} ]')
+        self.script.write_text(fixture)
+        self.env['TEST_PACKAGE_MANAGER']=manager
+        self.mock('sshd','''#!/bin/sh
+printf 'sshd %s\\n' "$*" >> "$TEST_CALLS"
+[ "${TEST_DAEMON_INVALID:-0}" = 0 ] || exit 1
+[ "$#" = 1 ] && [ "$1" = -T ] || exit 98
+''')
+        for tool in ('apt-get','dnf','yum'):
+            self.mock(tool,f'''#!/bin/sh
+printf 'PKG {tool} %s\\n' "$*" >> "$TEST_CALLS"
+[ "${{TEST_PACKAGE_ERROR:-0}}" = 0 ] || exit 77
+last=
+for arg do last=$arg; done
+case $last in
+    openssh-client|openssh-clients) : > "$TEST_ROOT/client-ready" ;;
+    openssh-server) : > "$TEST_ROOT/sshd-ready" ;;
+    cron|crontabs) : > "$TEST_ROOT/cron-ready" ;;
+esac
+''')
+
+    def test_root_apt_installs_missing_server_and_cron_only_after_valid_keys(self):
+        self.simulate_dependencies(sshd=False,cron=False)
+        self.run_script('-c')
+        calls=self.calls.read_text()
+        self.assertIn('PKG apt-get install -y openssh-server',calls)
+        self.assertIn('PKG apt-get install -y cron',calls)
+        self.assertEqual(calls.count('PKG apt-get update\n'),1)
+        self.assertLess(calls.index('/ssh.keys'),calls.index('PKG apt-get update'))
+        self.assertNotIn('upgrade',calls)
+        self.assertNotIn('systemctl',calls)
+        self.assertNotIn('service ',calls)
+        self.assertEqual(self.auth.read_bytes(),BEGIN+KEY+END)
+
+    def test_root_yum_and_dnf_install_recognized_packages(self):
+        for manager in ('yum','dnf'):
+            with self.subTest(manager=manager):
+                self.script.write_text(SCRIPT)
+                self.simulate_dependencies(manager=manager,sshd=False,cron=False)
+                self.calls.write_text('')
+                self.run_script('-c')
+                calls=self.calls.read_text()
+                self.assertIn(f'PKG {manager} install -y openssh-server',calls)
+                self.assertIn(f'PKG {manager} install -y crontabs',calls)
+                self.assertNotIn('PKG apt-get',calls)
+
+    def test_nonroot_missing_daemon_fails_without_packages_but_keys_only_works(self):
+        self.simulate_dependencies(uid='1001',sshd=False)
+        self.run_script(ok=False)
+        self.assertFalse(self.auth.exists())
+        self.assertNotIn('PKG ',self.calls.read_text())
+        self.run_script('-o')
+        self.assertEqual(self.auth.read_bytes(),BEGIN+KEY+END)
+        self.assertNotIn('sshd -T',self.calls.read_text())
+
+    def test_no_install_skips_missing_daemon_and_never_bootstraps_missing_client(self):
+        self.simulate_dependencies(sshd=False)
+        self.run_script('-n')
+        self.assertNotIn('PKG ',self.calls.read_text())
+        (self.root/'client-ready').unlink()
+        self.run_script('-n',ok=False)
+        self.assertNotIn('PKG ',self.calls.read_text())
+        self.run_script('-o',ok=False)
+        self.assertNotIn('PKG ',self.calls.read_text())
+
+    def test_existing_invalid_daemon_is_not_treated_as_missing_or_reinstalled(self):
+        self.simulate_dependencies(sshd=True)
+        original=self.old_auth()
+        result=self.run_script(ok=False,env={'TEST_DAEMON_INVALID':'1'})
+        self.assertIn('configuration cannot be evaluated',result.stderr)
+        self.assertNotIn('PKG ',self.calls.read_text())
+        self.assertEqual(self.auth.read_bytes(),original)
+
+    def test_invalid_keys_do_not_install_server_or_cron(self):
+        self.simulate_dependencies(sshd=False,cron=False)
+        self.payload.write_bytes(b'not a public-key document\n')
+        self.run_script('-c',ok=False)
+        self.assertNotIn('PKG ',self.calls.read_text())
+        self.assertFalse(self.auth.exists())
+        self.assertNotIn(CB,self.cron.read_text())
+
+    def test_missing_client_bootstrap_is_root_normal_only_and_precedes_key_validation(self):
+        self.simulate_dependencies(client=False,sshd=False)
+        self.run_script()
+        calls=self.calls.read_text()
+        self.assertLess(calls.index('install -y openssh-client'),calls.index('/ssh.keys'))
+        self.assertLess(calls.index('/ssh.keys'),calls.index('install -y openssh-server'))
+        self.assertEqual(calls.count('PKG apt-get update\n'),1)
+
+    def test_package_failure_or_unsupported_manager_preserves_keys_and_cron(self):
+        self.simulate_dependencies(sshd=False,cron=False)
+        original=self.old_auth()
+        before=self.cron.read_bytes()
+        result=self.run_script('-c',ok=False,env={'TEST_PACKAGE_ERROR':'1'})
+        self.assertIn('may have changed',result.stderr)
+        self.assertEqual(self.auth.read_bytes(),original)
+        self.assertEqual(self.cron.read_bytes(),before)
+        self.run_script('-c',ok=False,env={'TEST_PACKAGE_MANAGER':'unsupported'})
+        self.assertEqual(self.auth.read_bytes(),original)
+
+    def test_root_policy_combines_with_install_and_cron_then_updates_keys(self):
+        config=self.mock_root_config()
+        self.run_script('--install','-p','no','-c','5 2 * * *')
+        self.assertTrue(config.read_text().startswith('PermitRootLogin prohibit-password\n'))
+        self.assertEqual(self.auth.read_bytes(),BEGIN+KEY+END)
+        self.assertIn('5 2 * * * /bin/sh',self.cron.read_text())
+        self.assertTrue(self.installed.exists())
+        calls=self.calls.read_text()
+        self.assertNotIn('systemctl',calls)
+        self.assertNotIn('service ',calls)
+
+    def test_standard_global_include_preserved_and_effective_policy_checked(self):
+        config=self.mock_root_config('Include sshd_config.d/*.conf\nPort 2222\n')
+        directory=config.parent/'sshd_config.d'
+        directory.mkdir(mode=0o700)
+        drop=directory/'10-settings.conf'
+        drop.write_text('PasswordAuthentication no\nPermitRootLogin yes\n')
+        original=drop.read_bytes()
+        self.run_script('-p','no')
+        self.assertIn('Include sshd_config.d/*.conf\n',config.read_text())
+        self.assertTrue(config.read_text().startswith('PermitRootLogin prohibit-password\n'))
+        self.assertEqual(drop.read_bytes(),original)
+        self.assertIn('sshd -T -f',self.calls.read_text())
+        self.assert_clean()
+
+    def test_nested_include_match_and_symlink_dropins_fail_closed(self):
+        config=self.mock_root_config('Include sshd_config.d/*.conf\n')
+        directory=config.parent/'sshd_config.d'
+        directory.mkdir(mode=0o700)
+        drop=directory/'10-settings.conf'
+        original=config.read_bytes()
+        for body in ('Match User root\nPermitRootLogin yes\n','Include nested/*.conf\n','"Match" User root\n'):
+            drop.write_text(body)
+            self.run_script('-p','no',ok=False)
+            self.assertEqual(config.read_bytes(),original)
+            self.assertFalse(self.auth.exists())
+        drop.unlink()
+        outside=self.root/'outside-settings'
+        outside.write_text('PermitRootLogin yes\n')
+        drop.symlink_to(outside)
+        self.run_script('-p','no',ok=False)
+        self.assertEqual(config.read_bytes(),original)
+        self.assertEqual(outside.read_text(),'PermitRootLogin yes\n')
+
+    def test_concurrent_include_inventory_change_blocks_root_policy_commit(self):
+        config=self.mock_root_config('Include sshd_config.d/*.conf\n')
+        directory=config.parent/'sshd_config.d'
+        directory.mkdir(mode=0o700)
+        (directory/'10-settings.conf').write_text('PasswordAuthentication no\n')
+        old=config.read_bytes()
+        mock=self.bin/'sshd'
+        text=mock.read_text()
+        injected=f'''config=$2
+if [ "$operation" = -T ]; then printf 'PermitRootLogin yes\\n' > {shlex.quote(str(directory/'20-racing.conf'))}; fi
+'''
+        mock.write_text(text.replace('config=$2\n',injected,1))
+        result=self.run_script('-p','no',ok=False)
+        self.assertIn('inventory changed concurrently',result.stderr)
+        self.assertEqual(config.read_bytes(),old)
         self.assertFalse(self.auth.exists())
 
 
@@ -1294,6 +1477,173 @@ fi
         self.assertTrue((self.root/'export-failed-once').exists())
         self.assertTrue(self.installed.exists())
         self.assert_clean()
+
+
+    @property
+    def audit(self):
+        return self.home/'.conf-sshd/audit'
+
+    def audit_pointer(self,name='current'):
+        path=self.audit/name
+        if not path.exists(): return None
+        lines=path.read_text().splitlines()
+        self.assertEqual(lines[0],'conf-sshd-audit-pointer-v1')
+        self.assertIn(lines[1],('slot a','slot b'))
+        return self.audit/lines[1].split()[1]
+
+    def audit_snapshot(self):
+        return {str(path.relative_to(self.audit)):path.read_bytes() for path in self.audit.rglob('*') if path.is_file()}
+
+    def test_audit_preserves_exact_pair_metadata_actual_signer_and_bounded_history(self):
+        self.enroll()
+        first=self.audit_pointer()
+        self.assertEqual((first/'ssh.keys').read_bytes(),self.payload.read_bytes())
+        self.assertEqual((first/'ssh.keys.sig').read_bytes(),self.signature.read_bytes())
+        metadata=(first/'metadata').read_text()
+        self.assertIn('source '+ORIGIN+'/ssh.keys\n',metadata)
+        self.assertIn('signer-fingerprint '+self.fixtures['subkeys'][0]+'\n',metadata)
+        self.assertIn('primary-fingerprint '+self.fixtures['primary']+'\n',metadata)
+        self.assertIn('pinned-fingerprint '+self.fixtures['primary']+'\n',metadata)
+        self.assertIn('document-sha256 '+hashlib.sha256(self.payload.read_bytes()).hexdigest()+'\n',metadata)
+        self.assertRegex(metadata,r'installed-at [0-9]+\n')
+        self.set_release('sibling')
+        self.run_script('-o')
+        current=self.audit_pointer()
+        self.assertNotEqual(current,first)
+        self.assertEqual(self.audit_pointer('previous'),first)
+        self.assertIn('signer-fingerprint '+self.fixtures['subkeys'][1]+'\n',(current/'metadata').read_text())
+        self.run_script('-o')
+        self.assertEqual(sorted(path.name for path in self.audit.iterdir() if path.is_dir()),['a','b'])
+        for path in self.audit.rglob('*'):
+            self.assertEqual(path.stat().st_mode & 0o777,0o700 if path.is_dir() else 0o600)
+        self.assert_clean()
+
+    def test_failed_fetch_or_signature_leaves_current_and_history_byte_identical(self):
+        self.enroll()
+        self.run_script('-o')
+        original=self.audit_snapshot()
+        self.run_script('-o',ok=False,env={'TEST_SIG_STATUS':'404'})
+        self.assertEqual(self.audit_snapshot(),original)
+        self.set_release('wrongsigner')
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.audit_snapshot(),original)
+
+    def test_off_updates_invalidate_current_without_new_signature_or_audit_record(self):
+        self.enroll()
+        old=self.audit_pointer()
+        old_pair=((old/'ssh.keys').read_bytes(),(old/'ssh.keys.sig').read_bytes())
+        self.calls.write_text('')
+        self.run_tty('-o','--gpg-verification','off')
+        self.assertIsNone(self.audit_pointer())
+        self.assertEqual(self.audit_pointer('previous'),old)
+        self.assertEqual(((old/'ssh.keys').read_bytes(),(old/'ssh.keys.sig').read_bytes()),old_pair)
+        self.assertNotIn('/ssh.keys.sig',self.calls.read_text())
+        self.assertNotIn('/public-key.gpg',self.calls.read_text())
+        self.assertFalse((self.home/'.conf-sshd/pending.source').exists())
+
+    def test_audit_failure_windows_recover_without_mixed_or_falsely_current_pair(self):
+        self.enroll()
+        real_mv=shutil.which('mv')
+        destinations=['audit-slot','auth','replay','audit-current']
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                before_slot=self.audit_pointer()
+                before_pair=((before_slot/'ssh.keys').read_bytes(),(before_slot/'ssh.keys.sig').read_bytes())
+                self.set_release('next')
+                self.old_auth(b'# manual key before commit\n')
+                self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+case "$TEST_AUDIT_FAILURE:$last" in
+    audit-slot:"$HOME/.conf-sshd/audit/"*/ssh.keys.sig|auth:"$HOME/.ssh/authorized_keys"|replay:"$HOME/.conf-sshd/replay.state"|audit-current:"$HOME/.conf-sshd/audit/current") exit 74 ;;
+esac
+exec "{real_mv}" "$@"
+''')
+                self.run_script('-o',ok=False,env={'TEST_AUDIT_FAILURE':destination})
+                self.assertTrue((self.home/'.conf-sshd/pending.state').exists())
+                if destination=='audit-slot':
+                    self.assertEqual(self.audit_pointer(),before_slot)
+                else:
+                    self.assertIsNone(self.audit_pointer())
+                    self.assertEqual(self.audit_pointer('previous'),before_slot)
+                self.assertEqual(((before_slot/'ssh.keys').read_bytes(),(before_slot/'ssh.keys.sig').read_bytes()),before_pair)
+                (self.bin/'mv').unlink()
+                self.calls.write_text('')
+                self.run_script('-o')
+                recovered=self.audit_pointer()
+                self.assertEqual((recovered/'ssh.keys').read_bytes(),self.payload.read_bytes())
+                self.assertEqual((recovered/'ssh.keys.sig').read_bytes(),self.signature.read_bytes())
+                metadata=(recovered/'metadata').read_text()
+                self.assertIn('source '+ORIGIN+'/ssh.keys\n',metadata)
+                self.assertIn('signer-fingerprint '+self.fixtures['subkeys'][0]+'\n',metadata)
+                self.assertNotIn('curl ',self.calls.read_text())
+                self.assertFalse((self.home/'.conf-sshd/pending.source').exists())
+                self.assert_clean()
+
+    def test_legacy_pending_without_source_context_records_truthful_unknown_source(self):
+        self.enroll()
+        self.set_release('next')
+        real_mv=shutil.which('mv')
+        self.old_auth(b'# retained manual\n')
+        self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+[ "$last" != "$HOME/.ssh/authorized_keys" ] || exit 74
+exec "{real_mv}" "$@"
+''')
+        self.run_script('-o',ok=False)
+        (self.bin/'mv').unlink()
+        (self.home/'.conf-sshd/pending.source').unlink()
+        self.run_script('-o')
+        self.assertIn('source local-pending:original-source-unavailable\n',(self.audit_pointer()/'metadata').read_text())
+
+    def test_pending_source_context_must_match_document_and_signature(self):
+        self.enroll()
+        self.set_release('next')
+        real_mv=shutil.which('mv')
+        self.old_auth(b'# retained manual\n')
+        self.mock('mv',f'''#!/bin/sh
+last=
+for arg do last=$arg; done
+[ "$last" != "$HOME/.ssh/authorized_keys" ] || exit 74
+exec "{real_mv}" "$@"
+''')
+        self.run_script('-o',ok=False)
+        (self.bin/'mv').unlink()
+        context=self.home/'.conf-sshd/pending.source'
+        context.write_text(context.read_text().replace('sequence 6\n','sequence 999\n'))
+        original=self.auth.read_bytes()
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.auth.read_bytes(),original)
+        self.assertIsNone(self.audit_pointer())
+
+    def test_audit_symlinks_are_refused_without_touching_external_targets(self):
+        self.enroll()
+        current=self.audit_pointer()
+        other='b' if current.name=='a' else 'a'
+        outside=self.root/'audit-outside'
+        outside.mkdir()
+        (outside/'ssh.keys').write_text('outside unchanged\n')
+        (self.audit/other).symlink_to(outside,target_is_directory=True)
+        original=self.auth.read_bytes()
+        self.set_release('next')
+        self.run_script('-o',ok=False)
+        self.assertEqual(self.auth.read_bytes(),original)
+        self.assertEqual((outside/'ssh.keys').read_text(),'outside unchanged\n')
+        self.assertEqual(self.audit_pointer(),current)
+
+    def test_signature_consent_precedes_any_root_client_bootstrap(self):
+        self.simulate_dependencies(client=False,sshd=False)
+        self.enroll(answer='cancel',ok=False)
+        self.assertNotIn('PKG ',self.calls.read_text())
+        self.assertNotIn('curl ',self.calls.read_text())
+        self.assertFalse(self.auth.exists())
+        self.enroll()
+        calls=self.calls.read_text()
+        self.assertIn('install -y openssh-client',calls)
+        self.assertIn('install -y openssh-server',calls)
+        self.assertLess(calls.index('/public-key.gpg'),calls.index('install -y openssh-client'))
+        self.assertLess(calls.index('/ssh.keys.sig'),calls.index('install -y openssh-server'))
 
 
 if __name__ == '__main__':

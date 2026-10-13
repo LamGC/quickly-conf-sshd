@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
-import { commandsFor, renderPage } from "../cf-worker/src/view.js";
+import { commandsFor, pathsFor, renderPage } from "../cf-worker/src/view.js";
 import { makeSignedDocument, parsePublishedSignedRelease } from "../cf-worker/src/signed-release.js";
 
 const script = await readFile(new URL("../site/assets/app.js", import.meta.url), "utf8");
@@ -78,14 +78,14 @@ function setup({ commandTexts = commands.map(({command}) => command), savedTheme
 }
 
 function snapshot(overrides = {}) {
-  return {revision: "a".repeat(40), publishedAt: "2026-10-12T00:00:00Z", keys: [], keyCount: 1, sha256: "b".repeat(64), keyRevision: "c".repeat(64), commands, ...config, ...overrides};
+  return {revision: "a".repeat(40), publishedAt: "2026-10-12T00:00:00Z", keys: [], keyCount: 1, sha256: "b".repeat(64), keyRevision: "c".repeat(64), commands, ...config, signedRelease: {listId: "test-list"}, ...overrides};
 }
 function embeddedMetadata(page) {
   return JSON.parse(page.match(/<script id="release-data" type="application\/json">([\s\S]*?)<\/script>/)[1]);
 }
 
 test("homepage prerenders metadata and commands, never a public-key listing", () => {
-  for (const token of ["RELEASE_JSON", "COMMANDS_HTML", "REVISION", "PUBLISHED_AT", "KEY_COUNT", "REPOSITORY_URL", "RELEASE_LABEL", "PREVIEW_NOTICE", "SOURCE_LABEL", "SOURCE_STATUS", "SIGNATURE_STATUS", "CERTIFICATE_STATUS", "CERTIFICATE_LINK", "CONTENT_REVISION", "KEYS_NOTICE"]) {
+  for (const token of ["RELEASE_JSON", "COMMANDS_HTML", "PATHS_HTML", "REVISION", "PUBLISHED_AT", "KEY_COUNT", "REPOSITORY_URL", "RELEASE_LABEL", "PREVIEW_NOTICE", "SOURCE_LABEL", "SOURCE_STATUS", "SIGNATURE_STATUS", "CERTIFICATE_STATUS", "CERTIFICATE_LINK", "SIGNATURE_SECTION_START", "SIGNATURE_SECTION_END", "VERIFICATION_DEFAULT", "PATHS_INDEX", "CONTENT_REVISION", "KEYS_NOTICE"]) {
     assert.ok(html.includes(`@@${token}@@`), `${token} placeholder is required`);
   }
   assert.match(html, /<html lang="zh-CN">/);
@@ -108,7 +108,7 @@ test("homepage projection excludes raw keys, fingerprints, comments and signed d
   assert.doesNotMatch(page, new RegExp(secretMarker));
   assert.doesNotMatch(page, /ssh-ed25519|SHA256:|data-copy-target="key-|id="key-\d|class="key-card"/);
   const embedded = embeddedMetadata(page);
-  assert.deepEqual(Object.keys(embedded).sort(), ["schema", "revision", "publishedAt", "keyCount", "sha256", "keyRevision", "source", "sourceStatus", "signaturePresent", "signatureStatus", "certificatePresent", "certificateStatus", "repositoryUrl", "testFixture"].sort());
+  assert.deepEqual(Object.keys(embedded).sort(), ["schema", "revision", "publishedAt", "keyCount", "sha256", "keyRevision", "source", "sourceStatus", "signatureEnabled", "signaturePresent", "signatureStatus", "certificatePresent", "certificateStatus", "repositoryUrl", "testFixture"].sort());
   assert.deepEqual(embedded.source, {type: "gist", url: "https://gist.github.com/example/example"});
   assert.equal(embedded.keyCount, 1);
   assert.equal(embedded.keyRevision, "c".repeat(64));
@@ -194,17 +194,31 @@ test("commands use an explicit installer and fixed installed client; no self-upd
   assert.equal(byId.help.command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- -h");
   assert.match(byId.help.description, /不建立信任/);
   assert.match(byId.install.description, /备份.*保留本地配置/);
-  assert.match(byId.install.description, /首次安装或明确重装都会信任你执行的脚本/);
-  assert.match(byId.install.description, /推荐先独立核验安装脚本/);
+  assert.match(byId.reinstall.description, /首次安装或明确重装都会信任你执行的脚本/);
+  assert.match(byId.reinstall.description, /推荐先独立核验安装脚本/);
   assert.doesNotMatch(byId.install.description, /重装须使用.*本地脚本/);
+  assert.deepEqual(commands.filter(({advanced}) => !advanced).map(({id}) => id), ["install", "deploy-once", "keys-only", "root-on", "help"]);
+  assert.equal(byId["deploy-once"].command, "curl -fsSL 'https://example.test/script.sh' | sh -s --");
+  assert.equal(byId["keys-only"].command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- -o");
+  assert.equal(byId["root-on"].command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- -p yes");
+  assert.equal(byId["skip-sshd-install"].command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- -n");
+  assert.equal(byId["cron-custom"].command, 'sh "$HOME/.conf-sshd/conf-sshd.sh" -c \'0 */6 * * *\'');
+  assert.equal(byId["cron-stop"].command, 'sh "$HOME/.conf-sshd/conf-sshd.sh" -c false');
+  assert.equal(byId.status.command, 'sh "$HOME/.conf-sshd/conf-sshd.sh" --status');
+  assert.equal(byId.reinstall.command, "curl -fsSL 'https://example.test/script.sh' | sh -s -- --install --download-script");
+  assert.match(byId.install.description, /root 可按需安装 SSH Server 与 cron，非 root 缺少依赖时退出/);
+  assert.match(byId["deploy-once"].description, /不新增定时任务/);
+  assert.match(byId["keys-only"].description, /跳过 SSH Server 检查与软件包配置/);
+  assert.match(byId["root-on"].description, /须以 root 执行.*并部署公钥.*不自动重载/);
+  assert.match(byId.reinstall.description, /代替原 -u/);
   assert.equal(byId.update, undefined);
-  for (const id of ["root-off", "root-on", "uninstall"]) {
+  for (const id of ["root-off", "uninstall"]) {
     assert.equal(byId[id].advanced, true);
     assert.ok(byId[id].command.startsWith('sh "$HOME/.conf-sshd/conf-sshd.sh"'));
   }
   assert.ok(commands.every(({command}) => !/(?:^|\s)-u(?:\s|$)|--update/.test(command)));
   assert.match(html, /预期 SHA-256.*pin/);
-  assert.match(html, /验签默认关闭/);
+  assert.match(renderPage(html, snapshot()), /验签默认关闭/);
   assert.match(html, /--install --gpg-verification on/);
   assert.match(html, /远端发布内容不能关闭本地验签/);
   assert.match(html, /本地终端确认完整指纹，不能跳过确认/);
@@ -214,6 +228,53 @@ test("commands use an explicit installer and fixed installed client; no self-upd
   assert.match(html, /两者均返回 200/);
   assert.match(html, /href="\/ssh\.keys\.sig"/);
   assert.doesNotMatch(html, /\/key-release/);
+});
+
+test("Quick Usage and Paths retain original categories without repository setup instructions", () => {
+  assert.match(html, /Quick Usage · 快速使用/);
+  assert.match(html, /Paths · 访问地址/);
+  assert.doesNotMatch(html, /<h[1-6][^>]*>Install|Fork 本仓库|wrangler publish/);
+  const paths = pathsFor({...config, signedRelease: {listId: "test-list"}});
+  assert.deepEqual(paths.slice(0, 4).map(({id, url}) => ({id, url})), [
+    {id: "keys", url: "https://example.test/ssh.keys"},
+    {id: "script", url: "https://example.test/script.sh"},
+    {id: "root-script", url: "https://example.test/"},
+    {id: "homepage", url: "https://example.test/"},
+  ]);
+  assert.match(paths.find(({id}) => id === "root-script").description, /Curl.*Shell.*text\/html/);
+  assert.equal(paths.find(({id}) => id === "signature").url, "https://example.test/ssh.keys.sig");
+  assert.equal(paths.find(({id}) => id === "certificate").url, "https://example.test/public-key.gpg");
+  const page = renderPage(html, snapshot());
+  for (const path of paths) {
+    assert.ok(page.includes(`id="path-${path.id}">${path.url}</code>`));
+    assert.ok(page.includes(`data-copy-target="path-${path.id}"`));
+  }
+  assert.doesNotMatch(page, /copy-all-paths|copy-all-commands/);
+});
+
+test("section order and Signature visibility depend only on trusted signing configuration", () => {
+  for (const [state, enabled] of [
+    [{signedRelease: null, clientDefaults: {gpgVerification: "off"}}, false],
+    [{signedRelease: null, clientDefaults: {gpgVerification: "off"}, signatureAvailable: true, signedMetadata: {listId: "untrusted-metadata"}, publicCertificate: "opaque-cert"}, false],
+    [{signedRelease: {listId: "configured"}, clientDefaults: {gpgVerification: "off"}, signatureAvailable: false}, true],
+    [{signedRelease: null, clientDefaults: {gpgVerification: "on"}, signatureAvailable: false}, true],
+  ]) {
+    const page = renderPage(html, snapshot(state));
+    const sections = [...page.matchAll(/<section id="([^"]+)" class="content-section/g)].map((match) => match[1]);
+    assert.deepEqual(sections, enabled ? ["quick-start", "key-status", "signature", "paths"] : ["quick-start", "key-status", "paths"]);
+    assert.equal(embeddedMetadata(page).signatureEnabled, enabled);
+    assert.ok(page.includes(`href="${config.repositoryUrl}#readme"`), "installation instructions remain linked even without Signature");
+    assert.equal(page.includes('id="path-signature"'), enabled);
+    assert.equal(page.includes('id="path-certificate"'), enabled);
+    assert.doesNotMatch(page, /@@[A-Z_]+@@/);
+    if (enabled) {
+      assert.match(page, /Signature · 签名与本地信任/);
+      assert.match(page, /未提供签名包/);
+      if (state.clientDefaults.gpgVerification === "on") assert.match(page, /本仓库默认开启客户端验签/);
+      else assert.match(page, /客户端验签默认关闭/);
+    }
+  }
+  assert.deepEqual(pathsFor(config).map(({id}) => id), ["keys", "script", "root-script", "homepage"]);
 });
 
 test("default follows system and explicit light/dark/system choices persist", () => {
