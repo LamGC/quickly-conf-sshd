@@ -109,3 +109,84 @@ test('signature endpoint pairs with exact signed document, never the legacy wrap
   assert.equal(await(await unsigned(request('/ssh.keys'),env)).text(),document);
   assert.equal((await unsigned(request('/ssh.keys.sig'),env)).status,404);
 });
+
+const gistSource={type:'gist',id:'b'.repeat(32),ownerId:123,ownerLogin:'example'};
+const gistRevision='c'.repeat(40);
+const gistUrl=`https://api.github.com/gists/${gistSource.id}`;
+const gistFile=(filename,content)=>({filename,content,size:Buffer.byteLength(content),truncated:false});
+const gistData=files=>({id:gistSource.id,owner:{id:gistSource.ownerId},public:true,history:[{version:gistRevision}],files});
+const gistRelease={...release,keys:[],keyCount:0,allowEmpty:false,keySource:gistSource,fallbackSources:['https://keys.example.com/server.keys']};
+
+test('blank Gist publishes a legacy revocation consistently across page, metadata and keys',async()=>{
+  const visited=[];
+  const handler=createHandler(gistRelease,{fetchImpl:async url=>{
+    visited.push(url);
+    assert.ok(url===gistUrl||url===gistUrl+'/'+gistRevision,'Clear must not fetch fallback');
+    return new Response(JSON.stringify(gistData({'ssh.keys':gistFile('ssh.keys',' \t\r\n')})));
+  }});
+  const keysResponse=await handler(request('/ssh.keys'),env);
+  assert.equal(keysResponse.status,200);assert.equal(keysResponse.headers.get('X-Conf-Sshd-Source-Failure'),null);
+  assert.equal(keysResponse.headers.get('X-Conf-Sshd-Key-Source'),'gist');
+  assert.match(await keysResponse.text(),/# key-count 0\n# allow-empty yes\n/);
+  const metadata=await(await handler(request('/release.json'),env)).json();
+  assert.equal(metadata.keyCount,0);assert.equal(metadata.allowEmpty,true);
+  assert.equal(metadata.source.type,'gist');assert.equal(metadata.source.gistRevision,gistRevision);
+  assert.equal(metadata.signatureAvailable,false);assert.equal(metadata.signedMetadata,null);
+  const html=await(await handler(request('/'),env)).text();
+  assert.match(html,/明确撤销/);assert.doesNotMatch(html,/未发布撤销指令/);
+  assert.equal((await handler(request('/ssh.keys.sig'),env)).status,404);
+  assert.equal(visited.length,8);
+});
+
+test('ambiguous Gist clear produces validation-only 503 and never serves fallback keys',async()=>{
+  const handler=createHandler(gistRelease,{fetchImpl:async url=>{
+    assert.ok(url.startsWith(gistUrl),'Conflicting clear must not fetch fallback');
+    return new Response(JSON.stringify(gistData({'ssh.keys':gistFile('ssh.keys',''),'release.bundle':gistFile('release.bundle',fixture)})));
+  }});
+  for(const path of ['/ssh.keys','/ssh.keys.sig','/release.json','/']) {
+    const response=await handler(request(path),env);
+    assert.equal(response.status,503);
+    assert.equal(response.headers.get('X-Conf-Sshd-Source-Failure'),'validation');
+    const text=await response.text();
+    assert.doesNotMatch(text,/TEST-ONLY|BEGIN PGP|# allow-empty yes/);
+    if(path==='/')assert.match(text,/未发布撤销指令/);
+  }
+});
+
+test('source-failure header classifies exhausted validation, retrieval and mixed failures without details',async()=>{
+  const fallback={...release,keys:[],keyCount:0,fallbackSources:['https://keys.example.com/first','https://keys.example.com/second']};
+  const cases=[
+    ['validation',async()=>new Response('SECRET invalid content')],
+    ['retrieval',async()=>new Response('SECRET upstream error',{status:404})],
+    ['retrieval',async()=>{throw Error('SECRET network error');}],
+    ['retrieval',async url=>url.endsWith('first')?new Response('SECRET invalid content'):new Response('SECRET overloaded',{status:503})],
+    ['retrieval',async url=>url.endsWith('first')?new Response('SECRET denied',{status:403}):new Response('SECRET invalid content')],
+  ];
+  for(const [kind,fetchImpl] of cases) {
+    const handler=createHandler(fallback,{fetchImpl});
+    for(const method of ['GET','HEAD'])for(const path of ['/ssh.keys','/ssh.keys.sig','/release.json','/']) {
+      const response=await handler(request(path,{method}),env);
+      assert.equal(response.status,503);assert.equal(response.headers.get('X-Conf-Sshd-Source-Failure'),kind);
+      assert.equal(response.headers.get('Cache-Control'),'no-store');
+      assert.doesNotMatch(JSON.stringify([...response.headers]),/SECRET|keys\.example/);
+      const text=await response.text();assert.doesNotMatch(text,/SECRET/);
+      if(method==='HEAD')assert.equal(text,'');
+    }
+  }
+});
+
+test('missing and comment-only Gist files are validation failures while HTTP 404 is retrieval',async()=>{
+  for(const [files,kind] of [[{},'validation'],[{'ssh.keys':gistFile('ssh.keys','# placeholder\n')},'validation'],[null,'retrieval']]) {
+    const handler=createHandler({...gistRelease,fallbackSources:[]},{fetchImpl:async()=>files===null?new Response('',{status:404}):new Response(JSON.stringify(gistData(files)))});
+    const response=await handler(request('/ssh.keys'),env);
+    assert.equal(response.status,503);assert.equal(response.headers.get('X-Conf-Sshd-Source-Failure'),kind);
+    assert.doesNotMatch(await response.text(),/# allow-empty yes/);
+  }
+});
+
+test('successful fallback does not retain failed-source retry hints',async()=>{
+  const handler=createHandler({...release,keys:[],keyCount:0,fallbackSources:['https://keys.example.com/first','https://keys.example.com/second']},{fetchImpl:async url=>url.endsWith('first')?new Response('',{status:503}):new Response(fixture)});
+  const response=await handler(request('/ssh.keys'),env);
+  assert.equal(response.status,200);assert.equal(response.headers.get('X-Conf-Sshd-Source-Failure'),null);
+  assert.equal(await response.text(),bundle.text);
+});

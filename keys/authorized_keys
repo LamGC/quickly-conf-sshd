@@ -1,3 +1,4 @@
 # Add independently managed SERVER public keys here, one ordinary OpenSSH key per line.
 # Do not copy private keys or automatically import GitHub account authentication keys.
-# Empty production releases are rejected unless deployment.json explicitly sets allowEmpty=true.
+# This comment-only template is unconfigured. To intentionally clear managed keys, keep this file but remove all content.
+# GPG-enabled clients still require a valid signed revocation document.

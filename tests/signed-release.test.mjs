@@ -8,7 +8,7 @@ import {execFileSync} from 'node:child_process';
 import {makeSignedDocument, parseSignedDocument, parseSignedBundle, parsePublishedSignedRelease, SIGNATURE_SEPARATOR, SIGNED_RELEASE_LIMITS, validateSignature} from '../cf-worker/src/signed-release.js';
 import {prepare} from '../scripts/prepare-key-release.mjs';
 import {openPgpFixture} from './helpers/openpgp-fixture.mjs';
-import {verifyRemote} from '../scripts/verify-release.mjs';
+import {verifyProduction, verifyRemote} from '../scripts/verify-release.mjs';
 import {validateConfig, validateClientDefaults, build, root} from '../scripts/build.mjs';
 import {validatePublicCertificate, checkSigningCertificate, validatePayloadSignatureStatus} from '../scripts/signature-tools.mjs';
 
@@ -141,6 +141,54 @@ test('Git revocation bundle overrides legacy empty policy without falling back',
     await writeFile(join(dir,'keys/release.bundle'),revoke+SIGNATURE_SEPARATOR+signature);
     const result=await buildNow();assert.equal(result.allowEmpty,true);assert.equal(result.keyCount,0);assert.equal(result.needsFallback,false);
     assert.equal(await readFile(join(dir,'cf-worker/public/ssh.keys'),'utf8'),revoke);
+  });
+});
+
+test('an explicitly cleared authorized_keys cannot be repopulated by leftover signed artifacts',async()=>{
+  for(const filename of ['ssh.keys','release.bundle']) await buildFixture({},async(dir,buildNow)=>{
+    await writeFile(join(dir,'keys',filename),filename==='ssh.keys'?document:document+SIGNATURE_SEPARATOR+signature);
+    for(const content of ['',' \t\r\n']) {
+      await writeFile(join(dir,'keys/authorized_keys'),content);
+      await assert.rejects(buildNow(),/Ambiguous Git revocation/);
+    }
+    await rm(join(dir,'keys/authorized_keys'));
+    const result=await buildNow();assert.equal(result.keyCount,1);assert.equal(result.primaryFile,`keys/${filename}`);
+  });
+});
+
+test('clearing the selected signed publishing file is an OFF revocation, never a synthetic signed release',async()=>{
+  for(const filename of ['ssh.keys','release.bundle']) for(const content of ['',' \t\r\n']) await buildFixture({fallbackSources:['https://keys.example.com/fallback']},async(dir,buildNow)=>{
+    await writeFile(join(dir,'keys',filename),content);
+    await writeFile(join(dir,'keys/ssh.keys.sig'),signature);
+    for(const raw of [fixture,'invalid stale raw content']) {
+      await writeFile(join(dir,'keys/authorized_keys'),raw);
+      await assert.rejects(buildNow(),/Ambiguous Git revocation/);
+    }
+    // The shipped comments-only placeholder has never configured raw keys.
+    await writeFile(join(dir,'keys/authorized_keys'),'# Add server public keys here.\n');
+    const result=await buildNow();assert.equal(result.keyCount,0);assert.equal(result.allowEmpty,true);assert.equal(result.needsFallback,false);
+    assert.equal(result.primaryFile,`keys/${filename}`);assert.equal(result.signedDocument,null);assert.equal(result.signature,null);
+    await assert.rejects(readFile(join(dir,'cf-worker/public/ssh.keys.sig')),{code:'ENOENT'});
+    assert.match(await readFile(join(dir,'cf-worker/public/ssh.keys'),'utf8'),/# conf-sshd-v1\n/);
+    await rm(join(dir,'keys/authorized_keys'));
+    assert.equal((await buildNow()).allowEmpty,true);
+  });
+  for(const filename of ['ssh.keys','release.bundle']) await buildFixture({clientDefaults:{gpgVerification:'on',fingerprint:'A'.repeat(40),listId:'production'}},async(dir,buildNow)=>{
+    await writeFile(join(dir,'keys',filename),'');
+    await assert.rejects(buildNow(),/require a signed document/);
+  });
+});
+
+test('ON Git preflight accepts only a current signed revoke without falling back',async()=>{
+  await buildFixture({fallbackSources:['https://keys.example.com/fallback'],clientDefaults:{gpgVerification:'on',fingerprint:'A'.repeat(40),listId:'production'}},async(dir,buildNow)=>{
+    const revoke=await makeSignedDocument('',{...policy,revoke:true});
+    await writeFile(join(dir,'keys/release.bundle'),revoke+SIGNATURE_SEPARATOR+signature);
+    const release=await buildNow(), noFetch=()=>assert.fail('Git preflight must not fall back');
+    assert.equal(release.explicitEmpty,false);assert.equal(release.signedMetadata.revoke,true);
+    assert.match(await verifyProduction(release,noFetch,{now:200}),/0 key\(s\) from explicit-empty/);
+    await assert.rejects(verifyProduction(release,noFetch,{now:300}),/source|primary/i);
+    await assert.rejects(verifyProduction({...release,signature:null},noFetch,{now:200}),/source|primary/i);
+    await assert.rejects(verifyProduction({...release,signedDocument:revoke.replace('sequence 1','sequence 0')},noFetch,{now:200}),/source|primary/i);
   });
 });
 

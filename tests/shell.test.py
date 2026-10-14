@@ -57,13 +57,23 @@ class ShellTests(unittest.TestCase):
         self.cron.write_text('MAILTO=admin@example.test\n17 * * * * echo untouched\n')
         self.calls = self.root / 'calls'
         self.calls.write_text('')
+        self.clock = self.root / 'clock'
+        self.clock.write_text(str(int(time.time())))
         self.env = dict(os.environ, HOME=str(self.home), PATH=f'{self.bin}:/usr/bin:/bin',
                         TEST_ROOT=str(self.root), TEST_RESPONSE=str(self.payload),
                         TEST_UPDATE=str(self.update), TEST_CRONTAB=str(self.cron),
-                        TEST_CALLS=str(self.calls))
+                        TEST_CALLS=str(self.calls), TEST_CLOCK=str(self.clock))
         real_id = shutil.which('id')
         self.assertIsNotNone(real_id)
         self.mock('id', f'#!/bin/sh\nexec {shlex.quote(real_id)} "$@"\n')
+        self.mock('date', '''#!/bin/sh
+if [ "$*" = +%s ]; then cat "$TEST_CLOCK"; else exec /bin/date "$@"; fi
+''')
+        self.mock('sleep', '''#!/bin/sh
+case $1 in *.*) exec /bin/sleep "$@" ;; esac
+printf 'sleep %s\\n' "$1" >> "$TEST_CALLS"
+printf '%s\\n' "$(($(cat "$TEST_CLOCK") + $1))" > "$TEST_CLOCK"
+''')
         self.mock('curl', '''#!/bin/sh
 printf 'curl %s\\n' "$*" >> "$TEST_CALLS"
 [ "${TEST_CURL_ERROR:-0}" = 0 ] || exit "$TEST_CURL_ERROR"
@@ -71,12 +81,22 @@ if [ "${TEST_CURL_WAIT:-0}" = 1 ]; then
     : > "$TEST_ROOT/waiting"
     while [ ! -f "$TEST_ROOT/release" ]; do sleep 0.02; done
 fi
-out=
+out=; headers=; max_time=30
 while [ "$#" -gt 0 ]; do
-    case "$1" in --output) shift; out=$1 ;; https://*) url=$1 ;; esac
+    case "$1" in --output) shift; out=$1 ;; --dump-header) shift; headers=$1 ;; --max-time) shift; max_time=$1 ;; https://*) url=$1 ;; esac
     shift
 done
 status=${TEST_HTTP_STATUS:-200}
+source_failure=${TEST_SOURCE_FAILURE:-}
+case $url in */mirror/*) source_failure=${TEST_FALLBACK_SOURCE_FAILURE:-} ;; esac
+case $url in
+    */mirror/*) duration=${TEST_MIRROR_SECONDS:-0} ;;
+    */ssh.keys.sig) duration=${TEST_SIGNATURE_SECONDS:-0} ;;
+    */ssh.keys) duration=${TEST_BODY_SECONDS:-0} ;;
+    *) duration=0 ;;
+esac
+elapsed=$duration; [ "$elapsed" -le "$max_time" ] || elapsed=$max_time
+printf '%s\\n' "$(($(cat "$TEST_CLOCK") + elapsed))" > "$TEST_CLOCK"
 case $url in
     */script.sh) cp "$TEST_UPDATE" "$out" ;;
     */public-key.gpg) cp "${TEST_CERTIFICATE:-/nonexistent}" "$out" || exit 22; status=${TEST_CERT_STATUS:-$status} ;;
@@ -86,6 +106,21 @@ case $url in
     */ssh.keys) cp "$TEST_RESPONSE" "$out"; status=${TEST_KEY_STATUS:-$status} ;;
     *) exit 99 ;;
 esac
+case $url in
+    */mirror/*) failures=0; count_file="$TEST_ROOT/mirror-count" ;;
+    */ssh.keys.sig) failures=${TEST_SIGNATURE_FAILURES:-0}; count_file="$TEST_ROOT/signature-count" ;;
+    */ssh.keys) failures=${TEST_PRIMARY_FAILURES:-0}; count_file="$TEST_ROOT/primary-count" ;;
+    *) failures=0; count_file="$TEST_ROOT/other-count" ;;
+esac
+count=0; [ ! -f "$count_file" ] || count=$(cat "$count_file")
+count=$((count + 1)); printf '%s\\n' "$count" > "$count_file"
+[ "$count" -gt "$failures" ] || status=503
+if [ -n "$headers" ]; then
+    printf 'HTTP/1.1 %s fixture\\r\\n' "$status" > "$headers"
+    [ -z "$source_failure" ] || printf 'X-Conf-Sshd-Source-Failure: %s\\r\\n' "$source_failure" >> "$headers"
+    printf '\\r\\n' >> "$headers"
+fi
+if [ "$duration" -gt "$max_time" ]; then printf 000; exit 28; fi
 printf '%s' "$status"
 ''')
         self.mock('crontab', '''#!/bin/sh
@@ -252,6 +287,77 @@ fi
             self.assertIn(option, calls)
         self.assertNotIn('--location', calls)
 
+    def fetch_calls(self, suffix='/ssh.keys'):
+        return [line for line in self.calls.read_text().splitlines()
+                if line.startswith('curl ') and line.endswith(ORIGIN + suffix)]
+
+    def sleeps(self):
+        return [line for line in self.calls.read_text().splitlines() if line.startswith('sleep ')]
+
+    def test_five_total_retrieval_attempts_exact_backoff(self):
+        original = self.old_auth()
+        for status in ('301', '401', '403', '404', '408', '429', '500', '503'):
+            with self.subTest(status=status):
+                self.calls.write_text('')
+                self.run_script('-o', ok=False, env={'TEST_KEY_STATUS': status})
+                self.assertEqual(len(self.fetch_calls()), 5)
+                self.assertEqual(self.sleeps(), ['sleep 1', 'sleep 3', 'sleep 8', 'sleep 12'])
+                self.assertEqual(self.auth.read_bytes(), original)
+                self.assert_clean()
+
+    def test_fifth_retrieval_attempt_can_succeed(self):
+        self.run_script('-o', env={'TEST_PRIMARY_FAILURES': '4'})
+        self.assertEqual(len(self.fetch_calls()), 5)
+        self.assertEqual(self.sleeps(), ['sleep 1', 'sleep 3', 'sleep 8', 'sleep 12'])
+        self.assert_clean()
+
+    def test_invalid_body_skips_retries_and_reaches_valid_local_fallback(self):
+        fallback = self.root / 'fallback-response'
+        fallback.write_bytes(self.payload.read_bytes())
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.payload.write_bytes(b'invalid key list\n')
+        self.run_script('-o', '--fallback-urls-file', str(fallbacks),
+                        env={'TEST_FALLBACK_RESPONSE': str(fallback)})
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys')), 1)
+        self.assertEqual(self.sleeps(), [])
+        self.assert_clean()
+
+    def test_oversized_curl_response_is_validation_without_backoff(self):
+        original = self.old_auth()
+        self.run_script('-o', ok=False, env={'TEST_CURL_ERROR': '63'})
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(self.sleeps(), [])
+        self.assertEqual(self.auth.read_bytes(), original)
+        self.assert_clean()
+
+    def test_worker_validation_hint_only_skips_failed_response(self):
+        self.old_auth()
+        for hint, expected in [('validation', 1), ('retrieval', 5), ('unknown', 5),
+                               ('validation\r\nX-Conf-Sshd-Source-Failure: retrieval', 5)]:
+            with self.subTest(hint=hint):
+                self.calls.write_text('')
+                self.run_script('-o', ok=False, env={'TEST_KEY_STATUS': '503', 'TEST_SOURCE_FAILURE': hint})
+                self.assertEqual(len(self.fetch_calls()), expected)
+        self.calls.write_text('')
+        self.payload.write_bytes(b'invalid body\n')
+        self.run_script('-o', ok=False, env={'TEST_SOURCE_FAILURE': 'retrieval'})
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(self.sleeps(), [])
+
+    def test_each_local_source_has_independent_five_attempt_budget(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.old_auth()
+        self.run_script('-o', '--fallback-urls-file', str(fallbacks), ok=False,
+                        env={'TEST_KEY_STATUS': '503', 'TEST_FALLBACK_KEY_STATUS': '503'})
+        self.assertEqual(len(self.fetch_calls()), 5)
+        self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys')), 5)
+        self.assertEqual(self.sleeps(), ['sleep 1', 'sleep 3', 'sleep 8', 'sleep 12'] * 2)
+        self.assertFalse((self.home / '.conf-sshd/local.conf').exists())
+        self.assert_clean()
+
     def test_empty_set_requires_explicit_permission(self):
         original = self.old_auth(BEGIN + KEY + END + b'# keep\n')
         self.payload.write_bytes(response(b''))
@@ -260,6 +366,18 @@ fi
         self.payload.write_bytes(response(b'', allow='yes'))
         self.run_script('-o')
         self.assertEqual(self.auth.read_bytes(), BEGIN + END + b'# keep\n')
+
+    def test_valid_empty_primary_stops_before_local_fallback(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.old_auth(b'# unmanaged before\n' + BEGIN + KEY + END + b'# unmanaged after\n')
+        self.payload.write_bytes(response(b'', allow='yes'))
+        self.run_script('-o', '--fallback-urls-file', str(fallbacks))
+        self.assertEqual(self.auth.read_bytes(), b'# unmanaged before\n' + BEGIN + END + b'# unmanaged after\n')
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(self.fetch_calls('/mirror/ssh.keys'), [])
+        self.assertEqual(self.sleeps(), [])
+        self.assert_clean()
 
     def test_metadata_and_payload_corruption(self):
         original = self.old_auth()
@@ -452,7 +570,7 @@ fi
         self.assertEqual(state.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.auth.read_bytes(), b'# unmanaged\n')
 
-    def test_concurrent_run_refuses_and_signal_cleanup(self):
+    def test_concurrent_run_skips_and_reclaims_stale_pid(self):
         env = self.env | {'TEST_CURL_WAIT': '1'}
         first = subprocess.Popen(self.script_command('-o'), env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -461,8 +579,10 @@ fi
             while not (self.root / 'waiting').exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue((self.root / 'waiting').exists())
-            completed = self.run_script('-o', ok=False)
-            self.assertIn('Another run holds', completed.stderr)
+            before = self.calls.read_text()
+            completed = self.run_script('-o')
+            self.assertIn('Another run holds', completed.stdout)
+            self.assertEqual(self.calls.read_text(), before)
             (self.root / 'release').touch()
             stdout, stderr = first.communicate(timeout=10)
             self.assertEqual(first.returncode, 0, stdout + stderr)
@@ -472,12 +592,227 @@ fi
                 first.terminate()
                 first.communicate(timeout=10)
         self.assert_clean()
-        # A stale/foreign lock is never auto-removed.
+        # A safe legacy PID-only lock with a demonstrably absent owner recovers.
         lock = self.home / '.conf-sshd/lock'
-        lock.mkdir()
-        (lock / 'pid').write_text('999999')
+        lock.mkdir(mode=0o700)
+        (lock / 'pid').write_text('2147483647')
+        self.run_script('-o')
+        self.assert_clean()
+
+    def make_lock(self, pid='2147483647'):
+        state = self.home / '.conf-sshd'
+        state.mkdir(mode=0o700, exist_ok=True)
+        lock = state / 'lock'
+        lock.mkdir(mode=0o700)
+        if pid is not None:
+            (lock / 'pid').write_text(pid)
+        return lock
+
+    def wait_for_file(self, path, seconds=5):
+        deadline = time.monotonic() + seconds
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(path.exists(), str(path))
+
+    def test_live_unrelated_or_reused_pid_is_conservatively_skipped(self):
+        original = self.old_auth()
+        lock = self.make_lock(str(os.getpid()))
+        lock.parent.chmod(0o750)
+        result = self.run_script('-o')
+        self.assertIn('skipping', result.stdout)
+        self.assertEqual((lock / 'pid').read_text(), str(os.getpid()))
+        self.assertEqual(lock.parent.stat().st_mode & 0o777, 0o750)
+        self.assertEqual(self.auth.read_bytes(), original)
+        self.assertEqual(self.calls.read_text(), '')
+
+    def test_missing_malformed_or_uncertain_lock_owner_is_never_reaped(self):
+        for pid in (None, '', '0', '-1', 'abc', '2147483648', '1\n2\n', '2147483647\n\n'):
+            with self.subTest(pid=pid):
+                lock = self.make_lock(pid)
+                self.run_script('-o', ok=False)
+                self.assertTrue(lock.is_dir())
+                if pid is not None:
+                    self.assertEqual((lock / 'pid').read_text(), pid)
+                shutil.rmtree(lock)
+        lock = self.make_lock()
+        self.mock('ps', '#!/bin/sh\nexit 2\n')
         self.run_script('-o', ok=False)
-        self.assertTrue(lock.exists())
+        self.assertEqual((lock / 'pid').read_text(), '2147483647')
+        self.assertEqual(self.calls.read_text(), '')
+
+    def test_malicious_lock_paths_are_rejected_without_touching_targets(self):
+        outside = self.root / 'outside-lock'
+        outside.mkdir(mode=0o700)
+        (outside / 'pid').write_text('2147483647')
+        state = self.home / '.conf-sshd'
+        state.mkdir(mode=0o700)
+        lock = state / 'lock'
+        lock.symlink_to(outside, target_is_directory=True)
+        self.run_script('-o', ok=False)
+        self.assertEqual((outside / 'pid').read_text(), '2147483647')
+        lock.unlink()
+        lock.mkdir(mode=0o700)
+        (lock / 'pid').symlink_to(outside / 'pid')
+        self.run_script('-o', ok=False)
+        self.assertTrue((lock / 'pid').is_symlink())
+        (lock / 'pid').unlink()
+        os.link(outside / 'pid', lock / 'pid')
+        self.run_script('-o', ok=False)
+        (lock / 'pid').unlink()
+        (lock / 'pid').write_text('2147483647')
+        for path in (lock, lock / 'pid'):
+            mode = path.stat().st_mode & 0o777
+            path.chmod(0o777 if path.is_dir() else 0o666)
+            self.run_script('-o', ok=False)
+            path.chmod(mode)
+        (lock / 'reclaim').symlink_to(outside, target_is_directory=True)
+        self.run_script('-o', ok=False)
+        self.assertEqual((outside / 'pid').read_text(), '2147483647')
+        self.assertEqual(self.calls.read_text(), '')
+
+    def test_stale_lock_with_unexpected_files_is_not_partially_deleted(self):
+        lock = self.make_lock()
+        (lock / 'unexpected').write_text('preserve')
+        self.run_script('-o', ok=False)
+        self.assertEqual((lock / 'pid').read_text(), '2147483647')
+        self.assertEqual((lock / 'unexpected').read_text(), 'preserve')
+        self.assertFalse((lock / 'reclaim').exists())
+
+    def test_concurrent_stale_reclaimers_have_one_fetching_owner(self):
+        lock = self.make_lock()
+        self.mock('mkdir', '''#!/bin/sh
+/bin/mkdir "$@" || exit $?
+case "$*" in
+    */lock/reclaim)
+        if [ "${TEST_HOLD_RECLAIM:-0}" = 1 ]; then
+            : > "$TEST_ROOT/reclaim-waiting"
+            while [ ! -f "$TEST_ROOT/reclaim-release" ]; do /bin/sleep 0.02; done
+        fi ;;
+esac
+''')
+        first = subprocess.Popen(self.script_command('-o'),
+                                 env=self.env | {'TEST_HOLD_RECLAIM': '1'},
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_for_file(self.root / 'reclaim-waiting')
+            second = self.run_script('-o')
+            self.assertIn('recovering the stale lock', second.stdout)
+            self.assertEqual((lock / 'pid').read_text(), '2147483647')
+            self.assertEqual(self.fetch_calls(), [])
+            (self.root / 'reclaim-release').touch()
+            stdout, stderr = first.communicate(timeout=10)
+            self.assertEqual(first.returncode, 0, stdout + stderr)
+            self.assertEqual(len(self.fetch_calls()), 1)
+            self.assert_clean()
+        finally:
+            (self.root / 'reclaim-release').touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+
+    def test_delayed_reaper_cannot_retire_or_delete_a_new_live_lock(self):
+        lock = self.make_lock()
+        self.mock('mkdir', '''#!/bin/sh
+case "$*" in
+    */lock/reclaim)
+        if [ "${TEST_DELAY_RECLAIM:-0}" = 1 ]; then
+            : > "$TEST_ROOT/delayed-reaper"
+            while [ ! -f "$TEST_ROOT/delayed-release" ]; do /bin/sleep 0.02; done
+        fi ;;
+esac
+exec /bin/mkdir "$@"
+''')
+        delayed = subprocess.Popen(self.script_command('-o'),
+                                   env=self.env | {'TEST_DELAY_RECLAIM': '1'},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        owner = None
+        try:
+            self.wait_for_file(self.root / 'delayed-reaper')
+            owner = subprocess.Popen(self.script_command('-o'),
+                                     env=self.env | {'TEST_CURL_WAIT': '1'},
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.wait_for_file(self.root / 'waiting')
+            owner_pid = (lock / 'pid').read_bytes()
+            owner_inode = lock.stat().st_ino
+            (self.root / 'delayed-release').touch()
+            stdout, stderr = delayed.communicate(timeout=10)
+            self.assertNotEqual(delayed.returncode, 0, stdout + stderr)
+            self.assertIn('changed during recovery', stderr)
+            self.assertEqual((lock / 'pid').read_bytes(), owner_pid)
+            self.assertEqual(lock.stat().st_ino, owner_inode)
+            self.assertFalse((lock / 'reclaim').exists())
+            (self.root / 'release').touch()
+            stdout, stderr = owner.communicate(timeout=10)
+            self.assertEqual(owner.returncode, 0, stdout + stderr)
+            self.assertEqual(len(self.fetch_calls()), 1)
+            self.assert_clean()
+        finally:
+            (self.root / 'delayed-release').touch()
+            (self.root / 'release').touch()
+            for process in (delayed, owner):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=10)
+
+    def test_unpublished_pid_is_never_assumed_stale(self):
+        self.mock('mkdir', '''#!/bin/sh
+/bin/mkdir "$@" || exit $?
+case "$*" in
+    */lock)
+        : > "$TEST_ROOT/pid-waiting"
+        while [ ! -f "$TEST_ROOT/pid-release" ]; do /bin/sleep 0.02; done ;;
+esac
+''')
+        first = subprocess.Popen(self.script_command('-o'), env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_for_file(self.root / 'pid-waiting')
+            second = self.run_script('-o', ok=False)
+            self.assertIn('PID is missing or invalid', second.stderr)
+            self.assertTrue((self.home / '.conf-sshd/lock').is_dir())
+            (self.root / 'pid-release').touch()
+            stdout, stderr = first.communicate(timeout=10)
+            self.assertEqual(first.returncode, 0, stdout + stderr)
+            self.assertEqual(len(self.fetch_calls()), 1)
+            self.assert_clean()
+        finally:
+            (self.root / 'pid-release').touch()
+            if first.poll() is None:
+                first.terminate()
+                first.communicate(timeout=10)
+
+    def test_cleanup_does_not_remove_a_replacement_lock_or_pid_symlink(self):
+        for replace_directory in (True, False):
+            with self.subTest(replace_directory=replace_directory):
+                for barrier in ('waiting', 'release'):
+                    (self.root / barrier).unlink(missing_ok=True)
+                first = subprocess.Popen(self.script_command('-o'),
+                                         env=self.env | {'TEST_CURL_WAIT': '1'},
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.wait_for_file(self.root / 'waiting')
+                    lock = self.home / '.conf-sshd/lock'
+                    outside = self.root / 'replacement-pid'
+                    outside.write_text(str(os.getpid()))
+                    if replace_directory:
+                        lock.rename(self.root / 'old-lock')
+                        lock.mkdir(mode=0o700)
+                        (lock / 'pid').write_text(str(os.getpid()))
+                    else:
+                        (lock / 'pid').unlink()
+                        (lock / 'pid').symlink_to(outside)
+                    (self.root / 'release').touch()
+                    stdout, stderr = first.communicate(timeout=10)
+                    self.assertEqual(first.returncode, 0, stdout + stderr)
+                    self.assertTrue(lock.is_dir())
+                    self.assertEqual((lock / 'pid').read_text(), str(os.getpid()))
+                    self.assertEqual(outside.read_text(), str(os.getpid()))
+                finally:
+                    (self.root / 'release').touch()
+                    if first.poll() is None:
+                        first.terminate()
+                        first.communicate(timeout=10)
+                    shutil.rmtree(self.home / '.conf-sshd/lock')
 
     def test_update_self_is_explicit_atomic_and_fail_closed(self):
         self.run_script('-c')
@@ -1156,6 +1491,107 @@ exec "{real_gpg}" "$@"
         original = self.auth.read_bytes()
         self.run_script('-o', ok=False, env={'TEST_SIG_STATUS':'404', 'TEST_FALLBACK_SIG_STATUS':'404'})
         self.assertEqual(self.auth.read_bytes(), original)
+
+    def persistent_snapshot(self):
+        paths = [self.auth, *sorted((self.home / '.conf-sshd').rglob('*'))]
+        return {str(path.relative_to(self.home)): path.read_bytes()
+                for path in paths if path.is_file()}
+
+    def test_signature_fetch_uses_remaining_attempt_budget_and_retries_pair(self):
+        self.enroll()
+        original = self.persistent_snapshot()
+        self.calls.write_text('')
+        started = int(self.clock.read_text())
+        self.run_script('-o', ok=False,
+                        env={'TEST_BODY_SECONDS': '20', 'TEST_SIGNATURE_SECONDS': '11'})
+        self.assertEqual(len(self.fetch_calls()), 5)
+        signatures = self.fetch_calls('/ssh.keys.sig')
+        self.assertEqual(len(signatures), 5)
+        self.assertTrue(all('--max-time 10 ' in line for line in signatures))
+        self.assertTrue(all('--connect-timeout 10 ' in line for line in signatures))
+        self.assertEqual(int(self.clock.read_text()) - started, 5 * 30 + 24)
+        self.assertEqual(self.sleeps(), ['sleep 1', 'sleep 3', 'sleep 8', 'sleep 12'])
+        self.assertEqual(self.persistent_snapshot(), original)
+        self.assert_clean()
+
+    def test_exhausted_body_budget_never_starts_a_signature_request(self):
+        self.enroll()
+        original = self.persistent_snapshot()
+        self.calls.write_text('')
+        started = int(self.clock.read_text())
+        self.run_script('-o', ok=False, env={'TEST_BODY_SECONDS': '30'})
+        self.assertEqual(len(self.fetch_calls()), 5)
+        self.assertEqual(self.fetch_calls('/ssh.keys.sig'), [])
+        self.assertEqual(int(self.clock.read_text()) - started, 174)
+        self.assertEqual(self.persistent_snapshot(), original)
+
+    def test_signature_failure_counts_as_one_pair_attempt(self):
+        self.enroll()
+        self.calls.write_text('')
+        (self.root / 'signature-count').unlink()
+        self.run_script('-o', env={'TEST_SIGNATURE_FAILURES': '2'})
+        self.assertEqual(len(self.fetch_calls()), 3)
+        self.assertEqual(len(self.fetch_calls('/ssh.keys.sig')), 3)
+        self.assertEqual(self.sleeps(), ['sleep 1', 'sleep 3'])
+        self.assert_clean()
+
+    def test_strict_validation_failures_go_directly_to_next_source(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.enroll(extra=('--fallback-urls-file', str(fallbacks)))
+        fallback = self.root / 'fallback-response'
+        fallback_signature = self.root / 'fallback-signature'
+        fallback.write_text(self.fixtures['releases']['next']['data'])
+        fallback_signature.write_text(self.fixtures['releases']['next']['sig'])
+        for release in ('old', 'expired', 'wronglist', 'comment', 'wrongsigner'):
+            with self.subTest(release=release):
+                self.calls.write_text('')
+                self.set_release(release)
+                self.run_script('-o', env={'TEST_FALLBACK_RESPONSE': str(fallback),
+                                          'TEST_FALLBACK_SIGNATURE': str(fallback_signature)})
+                self.assertEqual(len(self.fetch_calls()), 1)
+                self.assertEqual(len(self.fetch_calls('/ssh.keys.sig')), int(release == 'wrongsigner'))
+                self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys')), 1)
+                self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys.sig')), 1)
+                self.assertEqual(self.sleeps(), [])
+                self.assert_clean()
+
+    def test_valid_signed_revocation_stops_before_local_fallback(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.old_auth(b'# keep unmanaged\n')
+        self.enroll(extra=('--fallback-urls-file', str(fallbacks)))
+        self.calls.write_text('')
+        self.set_release('revoke')
+        self.run_script('-o')
+        self.assertEqual(self.auth.read_bytes(), b'# keep unmanaged\n' + BEGIN + END)
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(len(self.fetch_calls('/ssh.keys.sig')), 1)
+        self.assertEqual(self.fetch_calls('/mirror/ssh.keys'), [])
+        self.assertEqual(self.sleeps(), [])
+        self.assertIn('sequence 6\n', self.replay.read_text())
+
+    def test_all_sources_fail_preserve_keys_audit_trust_and_replay(self):
+        fallbacks = self.root / 'fallbacks'
+        fallbacks.write_text(ORIGIN + '/mirror/ssh.keys\n')
+        self.enroll(extra=('--fallback-urls-file', str(fallbacks)))
+        original = self.persistent_snapshot()
+        self.calls.write_text('')
+        self.run_script('-o', ok=False,
+                        env={'TEST_KEY_STATUS': '503', 'TEST_FALLBACK_SIG_STATUS': '404'})
+        self.assertEqual(len(self.fetch_calls()), 5)
+        self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys')), 5)
+        self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys.sig')), 5)
+        self.assertEqual(self.persistent_snapshot(), original)
+        self.assert_clean()
+        self.calls.write_text('')
+        self.payload.write_bytes(response(b'', allow='yes'))
+        self.run_script('-o', ok=False)
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assertEqual(len(self.fetch_calls('/mirror/ssh.keys')), 1)
+        self.assertEqual(self.fetch_calls('/ssh.keys.sig'), [])
+        self.assertEqual(self.sleeps(), [])
+        self.assertEqual(self.persistent_snapshot(), original)
 
     def test_persisted_config_is_strict_data_never_executed(self):
         self.enroll()

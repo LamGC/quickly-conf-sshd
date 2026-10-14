@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {renderPage} from '../cf-worker/src/view.js';
 import {validateConfig,parseKeys,makeKeysText,commandsFor,build,root,digest} from '../scripts/build.mjs';
+import {verifyProduction} from '../scripts/verify-release.mjs';
 const config = {baseUrl:'https://ssh.example.com',repositoryUrl:'https://github.com/example/keys',defaultCron:'*/15 * * * *',allowEmpty:false};
 const fixture = await readFile(new URL('./fixtures/keys.pub',import.meta.url),'utf8');
 const canonicalFixture=fixture.trim().split(/ +/).slice(0,2).join(' ')+'\n';
@@ -63,7 +64,7 @@ test('build creates consistent assets/release; production empty is blocked',asyn
   } finally {await rm(directory,{recursive:true,force:true});}
 });
 
-test('fallback configuration allows an empty primary only with explicit bounded HTTPS sources',async()=>{
+test('fallback URLs cannot bypass the unconfigured-primary deployment gate',async()=>{
   assert.throws(()=>validateConfig({...config,fallbackSources:['http://keys.example.com']}));
   assert.throws(()=>validateConfig({...config,fallbackSources:['https://user:secret@keys.example.com']}));
   assert.throws(()=>validateConfig({...config,fallbackSources:Array(6).fill('https://keys.example.com')}));
@@ -72,9 +73,54 @@ test('fallback configuration allows an empty primary only with explicit bounded 
     for(const path of ['site','tests/fixtures','keys']) {await mkdir(join(directory,path),{recursive:true});await cp(join(root,path),join(directory,path),{recursive:true});}
     await cp(join(root,'conf-sshd.sh'),join(directory,'conf-sshd.sh'));
     await writeFile(join(directory,'deployment.json'),JSON.stringify({...config,fallbackSources:['https://keys.example.com/server.keys']}));
-    const release=await build({directory,revision:'d'.repeat(40)});
-    assert.equal(release.needsFallback,true);assert.equal(release.sha256,null);assert.equal(release.keyCount,0);
-    assert.ok((await readFile(join(directory,'cf-worker/public/index.html'),'utf8')).includes('未发布撤销指令'));
+    await assert.rejects(build({directory,revision:'d'.repeat(40)}),/No server public keys configured/);
+  } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+test('production distinguishes missing/comment-only files from deliberate blank revocations',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'conf-sshd-primary-build-'));
+  try {
+    for(const path of ['site','tests/fixtures','keys']) await cp(join(root,path),join(directory,path),{recursive:true});
+    await cp(join(root,'conf-sshd.sh'),join(directory,'conf-sshd.sh'));
+    const keyPath=join(directory,'keys/authorized_keys'), options={directory,revision:'e'.repeat(40)};
+    for(const allowEmpty of [false,true]) for(const fallbackSources of [[],['https://keys.example.com/server.keys']]) {
+      await writeFile(join(directory,'deployment.json'),JSON.stringify({...config,allowEmpty,fallbackSources}));
+      for(const content of [null,'# Add server keys here.\n','# placeholder\n \t\n']) {
+        if(content===null) await rm(keyPath,{force:true}); else await writeFile(keyPath,content);
+        await assert.rejects(build(options),/No server public keys configured/);
+      }
+      for(const content of ['',' ','\n','\r',' \t\r\n\t ']) {
+        await writeFile(keyPath,content);
+        const release=await build(options);
+        assert.equal(release.primaryFile,'keys/authorized_keys');assert.equal(release.allowEmpty,true);assert.equal(release.explicitEmpty,true);
+        assert.equal(release.needsFallback,false);assert.equal(release.needsSource,false);assert.equal(release.keyCount,0);
+        assert.equal(release.sha256,digest(''));assert.equal(release.signatureAvailable,false);
+        assert.match(await readFile(join(directory,'cf-worker/public/ssh.keys'),'utf8'),/# key-count 0\n# allow-empty yes\n/);
+        assert.match(await verifyProduction(release,()=>assert.fail('Git revocation must not fetch fallback')),/0 key\(s\) from explicit-empty/);
+      }
+      await writeFile(keyPath,fixture);
+      const release=await build(options);assert.equal(release.keyCount,1);
+      assert.match(await verifyProduction(release,()=>assert.fail('Git primary must not fetch fallback')),/1 key\(s\) from repository/);
+    }
+    for(const content of ['\u00a0','\v','\0','\r'.repeat(1024*1024+1)]) {
+      await writeFile(keyPath,content);
+      await assert.rejects(build(options));
+    }
+    await rm(keyPath);
+    const fixtureRelease=await build({...options,testFixture:true});
+    assert.equal(fixtureRelease.testFixture,true);assert.equal(fixtureRelease.keyCount,1);
+    await assert.rejects(verifyProduction(fixtureRelease),/test-fixture/);
+  } finally {await rm(directory,{recursive:true,force:true});}
+});
+
+test('ON builds never turn a blank unsigned Git file into a signed revoke',async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'conf-sshd-on-empty-'));
+  try {
+    await cp(join(root,'site'),join(directory,'site'),{recursive:true});await mkdir(join(directory,'keys'));
+    await cp(join(root,'conf-sshd.sh'),join(directory,'conf-sshd.sh'));
+    await writeFile(join(directory,'deployment.json'),JSON.stringify({...config,allowEmpty:true,fallbackSources:['https://keys.example.com/server.keys'],clientDefaults:{gpgVerification:'on',fingerprint:'A'.repeat(40),listId:'production'}}));
+    await writeFile(join(directory,'keys/authorized_keys'),'\n');
+    await assert.rejects(build({directory,revision:'f'.repeat(40)}),/require a signed document/);
   } finally {await rm(directory,{recursive:true,force:true});}
 });
 

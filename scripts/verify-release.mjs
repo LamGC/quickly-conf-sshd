@@ -2,11 +2,30 @@ import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
-import {parsePublicKeys} from '../cf-worker/src/key-source.js';
+import {parsePublicKeys, resolveKeys, validateKeySource} from '../cf-worker/src/key-source.js';
 import {parseSignedDocument, SIGNATURE_SEPARATOR, SIGNED_RELEASE_LIMITS, withoutKeyComments, validateSignature} from '../cf-worker/src/signed-release.js';
 import {checkSigningCertificate} from './signature-tools.mjs';
 const hash = text => createHash('sha256').update(text).digest('hex');
 const root = new URL('../', import.meta.url);
+
+/** Deployment checks the primary itself; a healthy fallback cannot hide an unconfigured primary. */
+export async function verifyProduction(release, fetchImpl = fetch, {now, timeoutMs} = {}) {
+  if (!release || release.testFixture) throw Error('Refusing to deploy a test-fixture or missing build. Run the production build with real server public keys.');
+  if (!/^[0-9a-f]{40}$/.test(release.revision)) throw Error('Production release revision is invalid.');
+  const keySource = validateKeySource(release.keySource);
+  if (keySource.type === 'git' && !['keys/authorized_keys', 'keys/ssh.keys', 'keys/release.bundle'].includes(release.primaryFile)) throw Error('Production Git release has no configured primary file. Rebuild with an existing key file.');
+  if (keySource.type === 'git' && !release.signedDocument && !release.signedBundle && !release.keys?.length && release.explicitEmpty !== true) throw Error('Production Git revocation lacks an explicitly empty primary file. Rebuild with an existing empty key file.');
+  const requireSigned = release.clientDefaults?.gpgVerification === 'on';
+  const snapshot = await resolveKeys(release, fetchImpl, {requirePrimary: true, requireSigned, ...(now === undefined ? {} : {now}), ...(timeoutMs === undefined ? {} : {timeoutMs})});
+  if (requireSigned && snapshot.signedMetadata?.listId !== release.clientDefaults.listId) throw Error('Client default list ID differs from the primary signed document.');
+  if (requireSigned && release.signedRelease?.fingerprint && release.clientDefaults.pinMode === 'primary' && release.clientDefaults.fingerprint !== release.signedRelease.fingerprint) throw Error('Client primary fingerprint differs from the configured signing certificate.');
+  if (snapshot.signedDocument && release.signedRelease?.publicKeyFile) {
+    if (!snapshot.signedBundle) throw Error('Configured build signature verification requires a valid detached signature.');
+    await checkSigningCertificate(release.publicCertificate, release.signedRelease.fingerprint, snapshot.signedBundle);
+  }
+  const cryptoNote = snapshot.signedDocument && !release.signedRelease?.publicKeyFile ? ' OpenPGP not checked: no build verification certificate configured.' : '';
+  return `Production primary checked: ${release.revision}; ${snapshot.keyCount} key(s) from ${snapshot.source.type}.${cryptoNote}`;
+}
 
 async function remoteText(url, maxBytes, {allowMissing = false, fetchImpl = fetch} = {}) {
   const signal = AbortSignal.timeout(20000);
@@ -29,7 +48,7 @@ async function remoteText(url, maxBytes, {allowMissing = false, fetchImpl = fetc
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 
-export async function verifyRemote(manifest, fetchImpl = fetch) {
+export async function verifyRemote(manifest, fetchImpl = fetch, {now} = {}) {
   const read = (path, maxBytes, allowMissing = false) => remoteText(manifest.baseUrl + path, maxBytes, {allowMissing, fetchImpl});
   const metadata = JSON.parse(await read('/release.json', 64 * 1024));
   if (metadata.revision !== manifest.revision || metadata.testFixture) throw Error('Remote release does not match this build.');
@@ -59,6 +78,7 @@ export async function verifyRemote(manifest, fetchImpl = fetch) {
       if (signature !== null) validateSignature(signature);
       cryptoNote = ' OpenPGP not checked: no build verification certificate configured.';
     }
+    if (manifest.clientDefaults?.gpgVerification === 'on') await parseSignedDocument(document, {listId: manifest.clientDefaults.listId, ...(now === undefined ? {} : {now})});
   } else {
     const match = /^# conf-sshd-v1\n# revision ([0-9a-f]{40})\n# key-count (0|[1-9][0-9]*)\n# allow-empty (yes|no)\n# sha256 ([0-9a-f]{64})\n# end-metadata\n([\s\S]*)$/.exec(document);
     if (!match || match[1] !== manifest.revision) throw Error('Remote key manifest invalid.');
@@ -66,7 +86,9 @@ export async function verifyRemote(manifest, fetchImpl = fetch) {
     if (hash(payload) !== digest) throw Error('Remote key body does not match its response digest.');
     const keys = await parsePublicKeys(payload);
     count = keys.length; payloadHash = digest;
-    if (keys.length !== Number(countText) || (!keys.length && (!manifest.allowEmpty || empty !== 'yes')) || withoutKeyComments(keys).map(key => key.text + '\n').join('') !== payload) throw Error('Remote key count/empty/canonical policy invalid.');
+    // A pinned Gist may be intentionally cleared after this code build, without changing allowEmpty.
+    const gistRevocation = manifest.keySource?.type === 'gist' && metadata.source?.type === 'gist' && metadata.allowEmpty === true && metadata.keyCount === 0;
+    if (keys.length !== Number(countText) || (!keys.length && ((!manifest.allowEmpty && !gistRevocation) || empty !== 'yes')) || withoutKeyComments(keys).map(key => key.text + '\n').join('') !== payload) throw Error('Remote key count/empty/canonical policy invalid.');
     if (manifest.clientDefaults?.gpgVerification === 'on') throw Error('Verification-enabled clients require a signed-format document.');
   }
   if (!dynamic && payloadHash !== manifest.sha256) throw Error('Remote repository payload differs from this build.');
@@ -75,8 +97,14 @@ export async function verifyRemote(manifest, fetchImpl = fetch) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const manifest = JSON.parse(await readFile(new URL('cf-worker/generated/manifest.json', root), 'utf8'));
-  if (manifest.testFixture) throw Error('Refusing to deploy a test-fixture build. Run the production build with real server public keys.');
-  if (!process.argv.includes('--remote')) console.log(`Production release checked: ${manifest.revision}`);
-  else console.log(await verifyRemote(manifest));
+  const args = process.argv.slice(2);
+  if (args.some(arg => arg !== '--remote') || args.length > 1) throw Error('Usage: node scripts/verify-release.mjs [--remote]');
+  if (args.includes('--remote')) {
+    const manifest = JSON.parse(await readFile(new URL('cf-worker/generated/manifest.json', root), 'utf8'));
+    if (manifest.testFixture) throw Error('Refusing to verify a test-fixture deployment.');
+    console.log(await verifyRemote(manifest));
+  } else {
+    const {default: release} = await import(new URL('cf-worker/generated/release.js', root));
+    console.log(await verifyProduction(release));
+  }
 }

@@ -30,6 +30,15 @@ cron_prepared=no
 auth_prepared=no
 temps=
 lock_owned=no
+lock_identity=
+lock_reclaim_owned=no
+lock_reclaim_identity=
+lock_reclaim_parent=
+retired_lock_parent=
+retired_parent_identity=
+retired_lock_identity=
+retired_lock_pid=
+retired_reclaim_identity=
 created_state=no
 created_ssh=no
 gpg_home=
@@ -217,8 +226,10 @@ audit_dir=$state/audit
 # GNU/Linux and BSD/macOS stat. No filesystem changes precede ownership checks.
 if stat -c '%u %a %h' "$HOME" >/dev/null 2>&1; then
     stat_info() { stat -c '%u %a %h' "$1"; }
+    path_identity() { stat -c '%d:%i' "$1"; }
 else
     stat_info() { stat -f '%u %Lp %l' "$1"; }
+    path_identity() { stat -f '%d:%i' "$1"; }
 fi
 check_path() {
     checked=$1
@@ -285,7 +296,17 @@ cleanup() {
         if command -v gpgconf >/dev/null 2>&1; then gpgconf --homedir "$gpg_home" --kill all >/dev/null 2>&1 || :; fi
         rm -rf "$gpg_home"
     fi
-    if [ "$lock_owned" = yes ]; then rm -f "$state/lock/pid"; rmdir "$state/lock" 2>/dev/null || :; fi
+    if [ -n "$retired_lock_parent" ]; then cleanup_retired_lock || :; fi
+    # Never clean a replacement lock (or follow a replaced PID symlink).
+    if [ "$lock_reclaim_owned" = yes ] && [ ! -L "$state/lock" ] &&
+       [ "$(path_identity "$state/lock" 2>/dev/null)" = "$lock_reclaim_parent" ] &&
+       [ ! -L "$state/lock/reclaim" ] && [ "$(path_identity "$state/lock/reclaim" 2>/dev/null)" = "$lock_reclaim_identity" ]; then
+        rmdir "$state/lock/reclaim" 2>/dev/null || :
+    fi
+    if [ "$lock_owned" = yes ] && lock_matches "$$" 2>/dev/null; then
+        rm -f "$state/lock/pid"
+        rmdir "$state/lock" 2>/dev/null || :
+    fi
     if [ "$dry_run" = yes ] || [ "$mode" = uninstall ]; then
         if [ "$created_ssh" = yes ]; then rmdir "$ssh_dir" 2>/dev/null || :; fi
         if [ "$created_state" = yes ] || [ "$mode" = uninstall ]; then rmdir "$state" 2>/dev/null || :; fi
@@ -319,16 +340,117 @@ if [ "$mode" = status ]; then
 fi
 
 [ -d "$state" ] || { mkdir "$state"; created_state=yes; }
-if [ "$dry_run" = no ]; then chmod 700 "$state"; fi
 trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if mkdir "$state/lock" 2>/dev/null; then
-    lock_owned=yes; printf '%s\n' "$$" > "$state/lock/pid"
-else
-    fail "Another run holds $state/lock. If it is stale, verify the recorded process before removing that directory."
-fi
+read_lock_pid() {
+    inspected_lock=${1:-$state/lock}
+    check_path "$inspected_lock" dir
+    [ -d "$inspected_lock" ] || return 1
+    check_path "$inspected_lock/pid" file
+    [ -f "$inspected_lock/pid" ] || return 1
+    [ "$(wc -c < "$inspected_lock/pid" | tr -d ' ')" -le 11 ] || return 1
+    # Accept legacy PID-only locks, including a missing final LF. Never signal
+    # PID 0, a process group, or an unbounded/unvalidated integer.
+    awk 'NR!=1 || $0 !~ /^[1-9][0-9]*$/ || length($0)>10 || $0+0>2147483647 {bad=1}
+         END {exit(bad || NR!=1)}' "$inspected_lock/pid" || return 1
+    cat "$inspected_lock/pid"
+}
+lock_matches() (
+    matched_lock=${2:-$state/lock}
+    matched_identity=${3:-$lock_identity}
+    [ ! -L "$matched_lock" ] && [ -d "$matched_lock" ] || exit 1
+    [ "$(path_identity "$matched_lock")" = "$matched_identity" ] || exit 1
+    [ "$(read_lock_pid "$matched_lock")" = "$1" ]
+)
+cleanup_retired_lock() {
+    [ ! -L "$retired_lock_parent" ] && [ -d "$retired_lock_parent" ] || return 1
+    [ "$(path_identity "$retired_lock_parent")" = "$retired_parent_identity" ] || return 1
+    if [ -e "$retired_lock_parent/lock" ] || [ -L "$retired_lock_parent/lock" ]; then
+        lock_matches "$retired_lock_pid" "$retired_lock_parent/lock" "$retired_lock_identity" || return 1
+        [ ! -L "$retired_lock_parent/lock/reclaim" ] || return 1
+        [ "$(path_identity "$retired_lock_parent/lock/reclaim")" = "$retired_reclaim_identity" ] || return 1
+        rm -f "$retired_lock_parent/lock/pid"
+        rmdir "$retired_lock_parent/lock/reclaim" || return 1
+        rmdir "$retired_lock_parent/lock" || return 1
+    fi
+    rmdir "$retired_lock_parent"
+}
+lock_process_state() {
+    lock_process=unknown
+    # A live reused PID is deliberately treated as occupied. Never kill an
+    # owner or infer staleness from its executable name/start-time mismatch.
+    if kill -0 "$lock_pid" 2>/dev/null; then lock_process=live; return; fi
+    # kill -0 can fail for permissions. Require a working process query before
+    # declaring absence; unavailable/unsupported ps fails closed.
+    command -v ps >/dev/null 2>&1 || return 0
+    self_pid=$(ps -p "$$" -o pid= 2>/dev/null | tr -d ' ') || return 0
+    [ "$self_pid" = "$$" ] || return 0
+    process_status=0
+    process_pid=$(ps -p "$lock_pid" -o pid= 2>/dev/null) || process_status=$?
+    process_pid=$(printf '%s' "$process_pid" | tr -d ' ')
+    if [ "$process_status" = 0 ] && [ "$process_pid" = "$lock_pid" ]; then lock_process=live
+    elif [ "$process_status" = 1 ] && [ -z "$process_pid" ]; then lock_process=dead; fi
+}
+acquire_lock() {
+    lock_recovered=no
+    while :; do
+        if mkdir "$state/lock" 2>/dev/null; then
+            lock_identity=$(path_identity "$state/lock") || fail 'Cannot inspect the new lock.'
+            (set -C; printf '%s\n' "$$" > "$state/lock/pid") || fail 'Cannot publish the new lock PID.'
+            lock_owned=yes
+            return
+        fi
+        check_path "$state/lock" dir
+        [ -d "$state/lock" ] || fail 'Cannot create the run lock.'
+        lock_identity=$(path_identity "$state/lock") || fail 'Cannot inspect the run lock.'
+        lock_pid=$(read_lock_pid) || fail "Lock PID is missing or invalid; leave $state/lock in place and inspect it before removal."
+        lock_matches "$lock_pid" || fail 'Run lock changed while being inspected; try again later.'
+        lock_process_state
+        case $lock_process in
+            live) say "Another run holds $state/lock (PID $lock_pid); skipping."; exit 0 ;;
+            unknown) fail 'Cannot prove that the lock owner exited; leaving the lock untouched.' ;;
+        esac
+        [ "$lock_recovered" = no ] || fail 'Run lock changed during recovery; try again later.'
+        # Serialize stale recovery inside the exact old directory. A second
+        # reaper must not rename/remove a newer lock acquired in the meantime.
+        if ! mkdir "$state/lock/reclaim" 2>/dev/null; then
+            check_path "$state/lock/reclaim" dir
+            say 'Another run is recovering the stale lock; skipping.'
+            exit 0
+        fi
+        lock_reclaim_identity=$(path_identity "$state/lock/reclaim")
+        lock_reclaim_parent=$(path_identity "$state/lock")
+        lock_reclaim_owned=yes
+        lock_matches "$lock_pid" || fail 'Run lock changed during recovery; leaving it untouched.'
+        lock_process_state
+        [ "$lock_process" = dead ] || fail 'Lock owner may still be running; leaving the lock untouched.'
+        for lock_entry in "$state/lock/"* "$state/lock/".[!.]* "$state/lock/"..?*; do
+            [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+            case $lock_entry in "$state/lock/pid"|"$state/lock/reclaim") : ;;
+                *) fail 'Unexpected lock contents; refusing automatic stale recovery.' ;; esac
+        done
+        # Retire the guarded inode atomically. Removing the in-directory guard
+        # before rmdir would let a delayed second reaper wedge the empty lock.
+        # A private empty destination prevents mv from merging into another run.
+        # This coordinates cooperating runs; arbitrary path replacement by the
+        # same UID is outside this lock's protection (as with the local state).
+        retired_lock_parent=$(mktemp -d "$state/.conf-sshd.lock.XXXXXX") || fail 'Cannot prepare stale-lock recovery.'
+        retired_parent_identity=$(path_identity "$retired_lock_parent")
+        retired_lock_identity=$lock_identity
+        retired_lock_pid=$lock_pid
+        retired_reclaim_identity=$lock_reclaim_identity
+        lock_matches "$lock_pid" || fail 'Run lock changed during recovery; leaving it untouched.'
+        mv "$state/lock" "$retired_lock_parent/lock" || fail 'Cannot retire the stale lock.'
+        lock_reclaim_owned=no
+        cleanup_retired_lock || fail 'Retired lock changed; inspect it before removal.'
+        retired_lock_parent=
+        lock_recovered=yes
+    done
+}
+acquire_lock
+if [ "$dry_run" = no ]; then chmod 700 "$state"; fi
 
 # Inputs are origin-only build constants; also reject unbuilt or corrupted scripts.
 validate_build() {
@@ -344,12 +466,30 @@ validate_build() {
 download() {
     need curl
     download_limit=${3:-1048576}
-    # No redirects. Partial/error bodies are never parsed as a successful source.
+    download_timeout=${4:-30}
+    download_failure=retrieval
+    new_temp "$state"; download_headers=$TEMP
+    # No redirects or curl retries. Caller owns the per-source attempt count.
+    # Headers can only reject a failed candidate, never authorize its contents.
+    curl_status=0
     http_status=$(curl --disable --fail --silent --show-error --proto '=https' --tlsv1.2 \
-        --connect-timeout 10 --max-time 30 --retry 0 \
-        --max-filesize "$download_limit" --output "$2" --write-out '%{http_code}' "$1") || return 1
-    [ "$http_status" = 200 ] || return 1
-    [ "$(wc -c < "$2" | tr -d ' ')" -le "$download_limit" ]
+        --connect-timeout 10 --max-time "$download_timeout" --retry 0 \
+        --max-filesize "$download_limit" --dump-header "$download_headers" \
+        --output "$2" --write-out '%{http_code}' "$1") || curl_status=$?
+    if [ "$http_status" = 503 ] && awk '
+        {sub(/\r$/, "")}
+        /^HTTP\// {count=0; validation=0; next}
+        tolower($0) ~ /^x-conf-sshd-source-failure:/ {
+            count++; value=$0; sub(/^[^:]*:[ \t]*/, "", value); sub(/[ \t]*$/, "", value)
+            if(value=="validation") validation++
+        }
+        END {exit !(count==1 && validation==1)}' "$download_headers"; then
+        download_failure=validation
+    fi
+    if [ "$curl_status" = 63 ]; then download_failure=validation; return 1; fi
+    [ "$curl_status" = 0 ] && [ "$http_status" = 200 ] || return 1
+    # An oversized response is deterministic invalid content, not transport.
+    if [ "$(wc -c < "$2" | tr -d ' ')" -gt "$download_limit" ]; then download_failure=validation; return 1; fi
 }
 sha256() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
@@ -1423,20 +1563,50 @@ sync_keys() {
     new_temp "$state"; response=$TEMP
     new_temp "$state"; signature=$TEMP
     accepted=no
-    # Full validation occurs per source. A failed mirror never permits a policy
-    # downgrade; candidate-local temporaries are cleaned even when fail() exits.
+    # Five total attempts per local endpoint. Each attempt shares one 30-second
+    # body/signature budget; only retrieval failures use the 1/3/8/12s backoff.
+    # Worker upstream fallback remains separate and does not multiply this loop.
+    need date
+    need sleep
     while IFS= read -r source_url; do
-        if download "$source_url" "$response" 1048576; then
-            if [ "$policy" = required ] && ! download "$source_url.sig" "$signature" 65536; then
-                say "Signature unavailable from $source_url; trying next locally configured source." >&2
-                continue
+        source_attempt=1
+        while [ "$source_attempt" -le 5 ]; do
+            attempt_started=$(date +%s)
+            attempt_deadline=$((attempt_started + 30))
+            source_failure=retrieval
+            if download "$source_url" "$response" 1048576 30; then
+                # Reject malformed/replayed/expired bodies before a signature
+                # retrieval failure could disguise them as retryable transport.
+                if ! ( lock_owned=no; lock_reclaim_owned=no; created_state=no; created_ssh=no; temps=; child_result=0
+                       trap 'child_result=$?; gpg_home=; cleanup "$child_result"' 0
+                       if [ "$policy" = required ]; then validate_signed_document; check_replay
+                       elif [ "$(sed -n '1p' "$response")" = '# conf-sshd-signed-v1' ]; then validate_signed_document
+                       else validate_legacy_response; fi ); then
+                    source_failure=validation
+                elif [ "$policy" = required ]; then
+                    remaining=$((attempt_deadline - $(date +%s)))
+                    # A backwards wall-clock adjustment must not extend this
+                    # request past the original maximum per-request timeout.
+                    if [ "$remaining" -gt 30 ]; then remaining=30; fi
+                    if [ "$remaining" -gt 0 ] && download "$source_url.sig" "$signature" 65536 "$remaining"; then
+                        source_failure=none
+                    elif [ "$remaining" -gt 0 ]; then source_failure=$download_failure; fi
+                else source_failure=none; fi
+            else source_failure=$download_failure; fi
+            if [ "$source_failure" = none ]; then
+                if ( lock_owned=no; lock_reclaim_owned=no; created_state=no; created_ssh=no; temps=; child_result=0
+                     # Preserve the caller keyring but never delete it here.
+                     trap 'child_result=$?; gpg_home=; cleanup "$child_result"' 0
+                     validate_response ); then accepted=yes; accepted_source=$source_url; break; fi
+                source_failure=validation
             fi
-            if ( lock_owned=no; created_state=no; created_ssh=no; gpg_home_saved=$gpg_home; gpg_home=; temps=; child_result=0
-                 # Preserve the caller keyring but never delete it in this subshell.
-                 gpg_home=$gpg_home_saved
-                 trap 'child_result=$?; gpg_home=; cleanup "$child_result"' 0
-                 validate_response ); then accepted=yes; accepted_source=$source_url; break; fi
-        fi
+            [ "$source_failure" = retrieval ] && [ "$source_attempt" -lt 5 ] || break
+            case $source_attempt in 1) retry_delay=1 ;; 2) retry_delay=3 ;; 3) retry_delay=8 ;; 4) retry_delay=12 ;; esac
+            say "Retrieval attempt $source_attempt/5 failed for $source_url; retrying in ${retry_delay}s." >&2
+            sleep "$retry_delay"
+            source_attempt=$((source_attempt + 1))
+        done
+        [ "$accepted" = no ] || break
         say "Rejected source $source_url; trying next locally configured source." >&2
     done < "$urls"
     [ "$accepted" = yes ] || fail 'No locally configured source passed the required policy; existing keys are unchanged.'

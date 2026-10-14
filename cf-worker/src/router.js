@@ -38,6 +38,7 @@ export function createHandler(release, {fetchImpl = globalThis.fetch} = {}) {
           headers.set('X-Conf-Sshd-Key-Source', snapshot.source.type);
         } catch (error) {
           if (error.code !== 'KEY_SOURCES_UNAVAILABLE') throw error;
+          headers.set('X-Conf-Sshd-Source-Failure', error.failureKind);
           if (url.pathname !== '/') return respond('No valid public key source is currently available. Existing server keys must be preserved.\n', 'text/plain; charset=utf-8', 503);
           snapshot = {...release,keys:[],keyCount:0,sha256:null,source:{type:'unavailable'}};
         }

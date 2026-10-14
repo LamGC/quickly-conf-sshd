@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {createHash, generateKeyPairSync} from 'node:crypto';
-import {FallbackUnavailableError, KEY_SOURCE_LIMITS, makeKeyBundle, parsePublicKeys, resolveKeys, validateFallbackSources} from '../cf-worker/src/key-source.js';
+import {FallbackUnavailableError, KEY_SOURCE_LIMITS, isExplicitEmptyKeyFile, makeKeyBundle, parsePublicKeys, resolveKeys, validateFallbackSources} from '../cf-worker/src/key-source.js';
 import {SIGNED_BUNDLE_MAX_BYTES, makeSignedDocument, SIGNATURE_SEPARATOR} from '../cf-worker/src/signed-release.js';
 
 const fixture = await readFile(new URL('./fixtures/keys.pub', import.meta.url), 'utf8');
@@ -470,4 +470,190 @@ test('named Gist bundles cannot silently downgrade to raw key files', async () =
     const result=await resolveKeys(gistRelease,async url=>url===urls[0]?response(fixture):jsonResponse(gistData({'release.bundle':gistFile('release.bundle',contents)})));
     assert.equal(result.source.type,'fallback');
   }
+});
+
+test('only an existing ASCII-whitespace-empty primary file expresses unsigned revocation', () => {
+  for (const input of ['', ' \t\r\n\n ']) assert.equal(isExplicitEmptyKeyFile(input), true);
+  for (const input of [null, undefined, 0, '# initial placeholder\n', '\u00a0', '\u0000', '\u000b', fixture]) assert.equal(isExplicitEmptyKeyFile(input), false);
+});
+
+for (const filename of ['ssh.keys', 'release.bundle']) {
+  for (const input of ['', ' \t\r\n\n ']) {
+    test(`blank pinned Gist ${filename} revokes without any fallback (${JSON.stringify(input)})`, async () => {
+      const visited = [];
+      const result = await resolveKeys(gistRelease, async url => {
+        visited.push(url);
+        assert.ok(url === gistUrl || url === gistUrl + '/' + gistRevision);
+        return jsonResponse(gistData({[filename]: gistFile(filename, input)}));
+      }, {requirePrimary: true});
+      assert.deepEqual(visited, [gistUrl, gistUrl + '/' + gistRevision]);
+      assert.equal(result.keyCount, 0); assert.equal(result.allowEmpty, true);
+      assert.equal(result.source.type, 'gist'); assert.equal(result.source.file, filename);
+      assert.equal(result.source.gistRevision, gistRevision);
+      assert.equal(result.sha256, hash(''));
+      assert.match(result.keysText, /# key-count 0\n# allow-empty yes\n/);
+      assert.equal(result.signedDocument, null); assert.equal(result.signature, null);
+    });
+  }
+}
+
+test('blank Gist primary and Git primary cannot be replaced with a strict signed fallback', async () => {
+  for (const filename of ['ssh.keys', 'release.bundle']) {
+    const visited = [];
+    const error = await unavailable(async url => {
+      visited.push(url);
+      if (!url.startsWith(gistUrl)) return response(signedBundleFixture);
+      return jsonResponse(gistData({[filename]: gistFile(filename, '')}));
+    }, {requireSigned: true, now: 200}, gistRelease);
+    assert.deepEqual(visited, [gistUrl, gistUrl + '/' + gistRevision]);
+    assert.deepEqual(error.diagnostics, [{index: -1, code: 'unsigned-revocation'}]);
+    assert.equal(error.failureKind, 'validation');
+  }
+  const error = await unavailable(() => assert.fail('Unsigned Git revocation must not fetch fallback'), {requireSigned: true}, {...emptyRelease, allowEmpty: true});
+  assert.equal(error.diagnostics[0].code, 'unsigned-revocation');
+});
+
+test('conflicting blank and nonblank Gist formats fail closed without fallback', async () => {
+  for (const [split, bundle] of [['', signedBundleFixture], [fixture, ''], ['# placeholder\n', ''], ['', 'invalid bundle']]) {
+    for (const options of [{}, {requireSigned: true, now: 200}, {requirePrimary: true}]) {
+      const visited = [];
+      const error = await unavailable(async url => {
+        visited.push(url);
+        if (!url.startsWith(gistUrl)) return response(fixture);
+        return jsonResponse(gistData({'ssh.keys': gistFile('ssh.keys', split), 'release.bundle': gistFile('release.bundle', bundle)}));
+      }, options, gistRelease);
+      assert.deepEqual(visited, [gistUrl, gistUrl + '/' + gistRevision]);
+      assert.deepEqual(error.diagnostics, [{index: -1, code: 'ambiguous-empty-primary'}]);
+    }
+  }
+});
+
+test('a validated Gist clear still blocks fallback when the competing format is malformed', async () => {
+  for (const emptyName of ['ssh.keys', 'release.bundle']) {
+    const otherName = emptyName === 'ssh.keys' ? 'release.bundle' : 'ssh.keys';
+    const error = await unavailable(async url => {
+      assert.ok(url.startsWith(gistUrl), 'Known clear must not fetch a fallback');
+      return jsonResponse(gistData({[emptyName]: gistFile(emptyName, ''), [otherName]: {...gistFile(otherName, fixture), truncated: true}}));
+    }, {}, gistRelease);
+    assert.equal(error.diagnostics[0].code, 'ambiguous-empty-primary');
+  }
+});
+
+test('both validated blank Gist formats express the same clear', async () => {
+  const result = await resolveKeys(gistRelease, async url => {
+    assert.ok(url.startsWith(gistUrl));
+    return jsonResponse(gistData({'ssh.keys': gistFile('ssh.keys', ''), 'release.bundle': gistFile('release.bundle', '\n')}));
+  });
+  assert.equal(result.keyCount, 0); assert.equal(result.allowEmpty, true);
+});
+
+test('empty latest Gist contents never override its pinned nonempty revision', async () => {
+  const result = await resolveKeys(gistRelease, async url => {
+    assert.ok(url.startsWith(gistUrl));
+    return jsonResponse(gistData({'ssh.keys': gistFile('ssh.keys', url === gistUrl ? '' : fixture)}));
+  });
+  assert.equal(result.keyCount, 1); assert.equal(result.allowEmpty, false);
+});
+
+test('missing, comments-only and untrusted Gist primaries never synthesize a clear', async () => {
+  const cases = [
+    () => gistData(),
+    () => gistData({'ssh.keys': gistFile('ssh.keys', '# initial placeholder\n\n')}),
+    () => ({...gistData({'ssh.keys': gistFile('ssh.keys', '')}), owner: {id: 999}}),
+    () => ({...gistData({'ssh.keys': gistFile('ssh.keys', '')}), history: [{version: '../invalid'}]}),
+    () => gistData({'ssh.keys': {...gistFile('ssh.keys', ''), size: 1}}),
+    () => gistData({'ssh.keys': {...gistFile('ssh.keys', ''), truncated: true}}),
+  ];
+  for (const data of cases) {
+    const result = await resolveKeys(gistRelease, async url => url.startsWith(gistUrl) ? jsonResponse(data()) : response(fixture));
+    assert.equal(result.source.type, 'fallback'); assert.equal(result.keyCount, 1); assert.equal(result.allowEmpty, false);
+    const error = await unavailable(async url => {
+      assert.ok(url.startsWith(gistUrl), 'Primary preflight cannot fetch fallback');
+      return jsonResponse(data());
+    }, {requirePrimary: true}, gistRelease);
+    assert.equal(error.failureKind, 'validation');
+  }
+});
+
+test('owner validation also precedes clear at the pinned Gist revision', async () => {
+  const error = await unavailable(async url => {
+    assert.ok(url.startsWith(gistUrl));
+    const data = gistData({'ssh.keys': gistFile('ssh.keys', '')});
+    if (url !== gistUrl) data.owner.id = 999;
+    return jsonResponse(data);
+  }, {requirePrimary: true}, gistRelease);
+  assert.deepEqual(error.diagnostics, [{index: -1, code: 'gist-owner-mismatch'}]);
+});
+
+test('Gist HTTP and network failure never clear and cannot be hidden by preflight fallback', async () => {
+  for (const mode of ['404', '503', 'network']) {
+    const fetcher = async url => {
+      if (!url.startsWith(gistUrl)) return response(fixture);
+      if (mode === 'network') throw Error('SECRET network information');
+      return new Response('', {status: Number(mode)});
+    };
+    const result = await resolveKeys(gistRelease, fetcher);
+    assert.equal(result.source.type, 'fallback'); assert.equal(result.allowEmpty, false);
+    const visited = [];
+    const error = await unavailable(async url => {visited.push(url); return fetcher(url);}, {requirePrimary: true}, gistRelease);
+    assert.deepEqual(visited, [gistUrl]); assert.equal(error.failureKind, 'retrieval');
+    assert.doesNotMatch(JSON.stringify(error), /SECRET|https:/);
+  }
+});
+
+test('primary-only preflight accepts signed revocation and rejects missing, malformed or unsigned Git primary', async () => {
+  const document = await makeSignedDocument('', {...signedPolicy, revoke: true});
+  const signed = {...emptyRelease, signedDocument: document, signature: signatureFixture};
+  const result = await resolveKeys(signed, () => assert.fail('No fetch'), {requirePrimary: true, requireSigned: true, now: 200});
+  assert.equal(result.keyCount, 0); assert.equal(result.allowEmpty, true);
+  for (const [release, options, code] of [
+    [emptyRelease, {}, 'unconfigured-primary'],
+    [{...emptyRelease, signedDocument: 'invalid'}, {}, 'invalid-signed-release'],
+    [{...emptyRelease, keys: fixtureKeys}, {requireSigned: true}, 'invalid-signed-release'],
+    [{...emptyRelease, allowEmpty: true}, {requireSigned: true}, 'unsigned-revocation'],
+  ]) {
+    const error = await unavailable(() => assert.fail('Preflight must not fetch'), {requirePrimary: true, ...options}, release);
+    assert.equal(error.diagnostics[0].code, code);
+  }
+  await assert.rejects(resolveKeys(emptyRelease, () => assert.fail('Invalid option must not fetch'), {requirePrimary: 'yes'}), /requirePrimary must be boolean/);
+});
+
+test('empty arbitrary fallback remains unavailable, including whitespace and comments', async () => {
+  for (const body of ['', ' \t\r\n', '# placeholder\n']) {
+    const error = await unavailable(async () => response(body), {}, {...emptyRelease, fallbackSources: [urls[0]]});
+    assert.equal(error.diagnostics[0].code, 'empty'); assert.equal(error.failureKind, 'validation');
+  }
+});
+
+test('failed-source retry classification retains any retrieval error even beyond bounded diagnostics', async () => {
+  for (const code of ['network-error', 'timeout', 'http-error', 'redirect']) {
+    const error = new FallbackUnavailableError([...Array.from({length: 5}, (_, index) => ({index, code: 'invalid-keys'})), {index: 5, code, status: 404}]);
+    assert.equal(error.failureKind, 'retrieval'); assert.equal(error.diagnostics.length, 5);
+  }
+  assert.equal(new FallbackUnavailableError([{index: -1, code: 'invalid-signed-release'}, {index: 0, code: 'empty'}]).failureKind, 'validation');
+});
+
+test('a stale detached signature does not turn a blank Gist file into a key-bearing conflict', async () => {
+  for (const signature of [signatureFixture, 'bad old signature']) {
+    const fetcher = async url => {
+      assert.ok(url.startsWith(gistUrl), 'Blank primary must not fetch fallback');
+      return jsonResponse(gistData({'ssh.keys': gistFile('ssh.keys', ''), 'ssh.keys.sig': gistFile('ssh.keys.sig', signature)}));
+    };
+    const result = await resolveKeys(gistRelease, fetcher, {requirePrimary: true});
+    assert.equal(result.keyCount, 0); assert.equal(result.allowEmpty, true);
+    assert.equal(result.signature, null); assert.equal(result.signedDocument, null);
+    const error = await unavailable(fetcher, {requirePrimary: true, requireSigned: true, now: 200}, gistRelease);
+    assert.equal(error.diagnostics[0].code, 'unsigned-revocation');
+  }
+});
+
+test('strict primary-only Gist preflight accepts an existing signed-format revocation unchanged', async () => {
+  const document = await makeSignedDocument('', {...signedPolicy, revoke: true});
+  const result = await resolveKeys(gistRelease, async url => {
+    assert.ok(url.startsWith(gistUrl));
+    return jsonResponse(gistData({'ssh.keys': gistFile('ssh.keys', document), 'ssh.keys.sig': gistFile('ssh.keys.sig', signatureFixture)}));
+  }, {requirePrimary: true, requireSigned: true, now: 200});
+  assert.equal(result.keyCount, 0); assert.equal(result.allowEmpty, true);
+  assert.equal(result.keysText, document); assert.equal(result.signature, signatureFixture);
+  assert.equal(result.signedMetadata.sequence, signedPolicy.sequence);
 });

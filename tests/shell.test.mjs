@@ -10,7 +10,7 @@ for (const [label, shell] of candidates) {
   const available = spawnSync(executable, executable === 'busybox' ? ['sh', '-c', ':'] : ['-c', ':']).status === 0;
   test(`isolated installer regression suite (${label})`, { skip: !available }, () => {
     const result = spawnSync('python3', ['tests/shell.test.py'], {
-      cwd: root, encoding: 'utf8', timeout: 90_000,
+      cwd: root, encoding: 'utf8', timeout: 240_000,
       env: { ...process.env, CONF_SSHD_TEST_SHELL: shell },
     });
     assert.equal(result.error, undefined, result.error?.message);

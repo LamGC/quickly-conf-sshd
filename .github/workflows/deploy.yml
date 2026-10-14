@@ -61,9 +61,10 @@ jobs:
       - run: npm test
         env:
           BROWSER_TESTS: '1'
-      - name: Build production release (empty keys fail unless explicitly allowed)
+      - name: Build production release (missing or unconfigured keys fail)
         run: npm run build
-      - run: node scripts/verify-release.mjs
+      - name: Preflight configured primary (fallback cannot mask failure)
+        run: node scripts/verify-release.mjs
       - name: Deploy the validated production bundle
         id: deploy
         run: |

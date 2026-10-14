@@ -9,7 +9,7 @@ export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const digest = data => createHash('sha256').update(data).digest('hex');
 import { escapeHTML, commandsFor, renderCommands, renderPage } from '../cf-worker/src/view.js';
 export { escapeHTML, commandsFor, renderCommands };
-import { validateFallbackSources, parsePublicKeys, validateKeySource, validateSignedReleaseConfig } from '../cf-worker/src/key-source.js';
+import { validateFallbackSources, parsePublicKeys, validateKeySource, validateSignedReleaseConfig, isExplicitEmptyKeyFile } from '../cf-worker/src/key-source.js';
 import {withoutKeyComments, parsePublishedSignedRelease, SIGNATURE_SEPARATOR} from '../cf-worker/src/signed-release.js';
 import {checkSigningCertificate, validatePublicCertificate} from './signature-tools.mjs';
 
@@ -83,34 +83,46 @@ export function makeKeysText(keys, revision, allowEmpty) {
 
 export async function build({directory = root, outDirectory = join(directory,'cf-worker'), testFixture = false, revision, publishedAt} = {}) {
   const config = validateConfig(JSON.parse(await readFile(join(directory,'deployment.json'),'utf8')));
-  const input = config.keySource?.type === 'gist' && !testFixture ? '' : await readFile(join(directory,testFixture ? 'tests/fixtures/keys.pub' : 'keys/authorized_keys'),'utf8').catch(error => {if (error.code === 'ENOENT' && !testFixture) return ''; throw error;});
+  const optional = async path => { try { return await readFile(join(directory, path), 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
+  let input = testFixture ? await readFile(join(directory, 'tests/fixtures/keys.pub'), 'utf8') : config.keySource?.type === 'gist' ? null : await optional('keys/authorized_keys');
   let keys = [];
   revision ||= process.env.GITHUB_SHA || execFileSync('git',['rev-parse','HEAD'],{cwd:directory,encoding:'utf8'}).trim();
   if (!/^[0-9a-f]{40}$/.test(revision)) throw Error('Release revision must be a 40-character Git commit SHA.');
   publishedAt ||= new Date().toISOString();
   const fallbackSources = validateFallbackSources(config.fallbackSources ?? []);
   const keySource = validateKeySource(config.keySource), signedRelease = validateSignedReleaseConfig(config.signedRelease);
-  const optional = async path => { try { return await readFile(join(directory, path), 'utf8'); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } };
-  let signed = null, publicCertificate = null;
+  let signed = null, publicCertificate = null, primaryFile = null;
   if (keySource.type === 'git' && !testFixture) {
     const documentFile = await optional('keys/ssh.keys'), bundleFile = await optional('keys/release.bundle');
     if (documentFile !== null && bundleFile !== null) throw Error('Use keys/ssh.keys plus its optional signature OR keys/release.bundle, not both.');
     if (documentFile !== null || bundleFile !== null) {
-      const separator = bundleFile?.indexOf(SIGNATURE_SEPARATOR) ?? -1;
-      if (bundleFile !== null && separator < 0) throw Error('release.bundle lacks its detached-signature separator.');
-      const document = documentFile ?? bundleFile.slice(0, separator);
-      const signature = documentFile !== null ? await optional('keys/ssh.keys.sig') : bundleFile.slice(separator + SIGNATURE_SEPARATOR.length);
-      signed = await parsePublishedSignedRelease(document, signature, {listId: signedRelease?.listId, checkFreshness: false});
-      keys = signed.keys;
-    }
+      // Do not let a leftover signed artifact silently override an explicitly cleared raw file.
+      if (isExplicitEmptyKeyFile(input)) throw Error('Ambiguous Git revocation: empty keys/authorized_keys conflicts with a signed publishing file. Keep only the intended publishing form.');
+      const rawHasContent = input !== null && input.split(/\r?\n/).some(line => {const text = line.replace(/^[ \t]+|[ \t]+$/g, ''); return text !== '' && !text.startsWith('#');});
+      if (isExplicitEmptyKeyFile(documentFile ?? bundleFile) && rawHasContent) throw Error('Ambiguous Git revocation: empty signed publishing file conflicts with nonempty keys/authorized_keys. Keep only the intended publishing form.');
+      primaryFile = documentFile !== null ? 'keys/ssh.keys' : 'keys/release.bundle';
+      input = documentFile ?? bundleFile;
+      if (!isExplicitEmptyKeyFile(input)) {
+        const separator = bundleFile?.indexOf(SIGNATURE_SEPARATOR) ?? -1;
+        if (bundleFile !== null && separator < 0) throw Error('release.bundle lacks its detached-signature separator.');
+        const document = documentFile ?? bundleFile.slice(0, separator);
+        const signature = documentFile !== null ? await optional('keys/ssh.keys.sig') : bundleFile.slice(separator + SIGNATURE_SEPARATOR.length);
+        signed = await parsePublishedSignedRelease(document, signature, {listId: signedRelease?.listId, checkFreshness: false});
+        keys = signed.keys;
+      }
+    } else primaryFile = 'keys/authorized_keys';
+    if (input === null) throw Error(`No server public keys configured: ${primaryFile} is missing. Keep an existing empty file for an explicit revocation.`);
   }
-  if (!signed) keys = withoutKeyComments(await parseKeys(input));
+  // A blank file may use lone CR line endings; retain its byte count for parser limits.
+  if (!signed) keys = withoutKeyComments(await parseKeys(isExplicitEmptyKeyFile(input) ? input.replace(/\r/g, '\n') : input ?? ''));
+  const explicitEmpty = !testFixture && keySource.type === 'git' && isExplicitEmptyKeyFile(input);
+  if (!testFixture && keySource.type === 'git' && !signed && !keys.length && !explicitEmpty) throw Error('No server public keys configured: a comments-only placeholder is not an explicit empty revocation.');
   if (signedRelease?.publicKeyFile) {
     publicCertificate = validatePublicCertificate(await readFile(join(directory, signedRelease.publicKeyFile), 'utf8'));
     if (signed && !signed.bundle) throw Error('Configured build signature verification requires a valid detached signature.');
     await checkSigningCertificate(publicCertificate, signedRelease.fingerprint, signed?.bundle);
   }
-  const allowEmpty = signed ? signed.metadata.revoke : config.allowEmpty;
+  const allowEmpty = signed ? signed.metadata.revoke : explicitEmpty || config.allowEmpty;
   const needsFallback = keySource.type === 'git' && keys.length === 0 && !allowEmpty && fallbackSources.length > 0;
   const needsSource = keySource.type === 'gist' || needsFallback;
   if (keySource.type === 'gist') keys = [];
@@ -130,7 +142,7 @@ export async function build({directory = root, outDirectory = join(directory,'cf
   if (/@@[A-Z_]+@@/.test(script)) throw Error('Unresolved script template token.');
   if (!script.includes('# conf-sshd-script-v2')) throw Error('Missing script format marker.');
   execFileSync('sh',['-n'],{input:script,stdio:['pipe','pipe','pipe']});
-  const release = {schema:1,revision,publishedAt,keyCount:keys.length,allowEmpty,sha256:bundle.sha256,keyRevision:signed?.metadata.documentSha256 ?? bundle.sha256,testFixture,baseUrl:config.baseUrl,repositoryUrl:config.repositoryUrl,fallbackSources,keySource,signedRelease,clientDefaults,publicCertificate,signedDocument:signed?.document ?? null,signature:signed?.signature ?? null,signatureAvailable:Boolean(signed?.signature),publicCertificateAvailable:Boolean(publicCertificate),signedBundle:signed?.bundle ?? null,signedMetadata:signed?.metadata ?? null,needsFallback,needsSource,keys,commands:commandsFor(config)};
+  const release = {schema:1,revision,publishedAt,keyCount:keys.length,allowEmpty,sha256:bundle.sha256,keyRevision:signed?.metadata.documentSha256 ?? bundle.sha256,testFixture,baseUrl:config.baseUrl,repositoryUrl:config.repositoryUrl,fallbackSources,keySource,primaryFile,explicitEmpty,signedRelease,clientDefaults,publicCertificate,signedDocument:signed?.document ?? null,signature:signed?.signature ?? null,signatureAvailable:Boolean(signed?.signature),publicCertificateAvailable:Boolean(publicCertificate),signedBundle:signed?.bundle ?? null,signedMetadata:signed?.metadata ?? null,needsFallback,needsSource,keys,commands:commandsFor(config)};
   let html = await readFile(join(directory,'site/index.html'),'utf8');
   const publicDir = join(outDirectory,'public'), generatedDir = join(outDirectory,'generated');
   await rm(publicDir,{recursive:true,force:true});

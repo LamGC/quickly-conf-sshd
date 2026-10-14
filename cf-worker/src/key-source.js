@@ -12,12 +12,20 @@ class SourceError extends Error {
 }
 export class FallbackUnavailableError extends Error {
   constructor(diagnostics = []) {
-    super('No configured SSH key source returned a valid nonempty key set.');
+    super('No configured SSH key source returned a valid key release.');
     this.name = 'FallbackUnavailableError';
     this.code = 'KEY_SOURCES_UNAVAILABLE';
+    // A mixed failure is still worth retrying if any upstream could not be retrieved.
+    // This hint can only affect retry timing; it never makes a response trustworthy.
+    this.failureKind = diagnostics.some(({code}) => ['network-error', 'timeout', 'http-error', 'redirect'].includes(code)) ? 'retrieval' : 'validation';
     // Keep diagnostics safe to log or return: no response content, URL secrets, or exception text.
     this.diagnostics = diagnostics.slice(0, KEY_SOURCE_LIMITS.sources).map(({index, code, status}) => ({index, code, ...(status === undefined ? {} : {status})}));
   }
+}
+
+/** Only an existing, deliberately blank primary file means revoke; comments do not. */
+export function isExplicitEmptyKeyFile(input) {
+  return typeof input === 'string' && /^[\t\r\n ]*$/.test(input);
 }
 
 export function validateFallbackSources(sources = []) {
@@ -276,28 +284,53 @@ async function fetchGist(source, fetchImpl, limits, release, options) {
     const gistRevision = latest.history?.[0]?.version;
     if (typeof gistRevision !== 'string' || !/^[0-9a-f]{40}$/.test(gistRevision)) throw new SourceError('invalid-gist-revision');
     const pinned = await get(`/${gistRevision}`);
+    const readFile = filename => {
+      const file = pinned.files[filename];
+      if (!file || file.filename !== filename || file.truncated !== false || typeof file.content !== 'string' || (file.encoding !== undefined && file.encoding !== 'utf-8')) throw new SourceError('invalid-gist-file');
+      const size = encoder.encode(file.content).length;
+      const max = filename === source.bundleFile ? SIGNED_BUNDLE_MAX_BYTES : limits.maxBytes;
+      if (!Number.isSafeInteger(file.size) || file.size !== size || size > max) throw new SourceError('too-large');
+      return file;
+    };
     const filename = Object.hasOwn(pinned.files, source.bundleFile) ? source.bundleFile : source.file;
-    const file = pinned.files[filename];
-    if (!file || file.filename !== filename || file.truncated !== false || typeof file.content !== 'string' || (file.encoding !== undefined && file.encoding !== 'utf-8')) throw new SourceError('invalid-gist-file');
+    if (filename === source.bundleFile && Object.hasOwn(pinned.files, source.file)) {
+      // A cleared split file must never be silently replaced by an older bundle,
+      // or vice versa. Validate the clear before trusting it, then fail closed if
+      // the other format conflicts or is unreadable. Both blank express one intent.
+      const validEmpty = name => {
+        if (!isExplicitEmptyKeyFile(pinned.files[name]?.content)) return false;
+        try { return isExplicitEmptyKeyFile(readFile(name).content); } catch { return false; }
+      };
+      const splitEmpty = validEmpty(source.file), bundleEmpty = validEmpty(source.bundleFile);
+      if (splitEmpty !== bundleEmpty) {
+        throw new SourceError('ambiguous-empty-primary');
+      }
+    }
+    const file = readFile(filename);
+    const provenance = {type: 'gist', id: source.id, ownerId: source.ownerId, ownerLogin: source.ownerLogin, gistRevision, file: filename, url: `https://gist.github.com/${source.ownerLogin}/${source.id}/${gistRevision}`};
+    const explicitEmpty = isExplicitEmptyKeyFile(file.content);
+    if (explicitEmpty) {
+      if (options.requireSigned) throw new SourceError('unsigned-revocation');
+      return {keys: [], signed: null, explicitEmpty: true, source: provenance};
+    }
     if (filename === source.bundleFile && (!file.content.startsWith('# conf-sshd-signed-v1\n') || !file.content.includes(SIGNATURE_SEPARATOR))) throw new SourceError('invalid-signed-release');
-    const size = encoder.encode(file.content).length;
-    const max = filename === source.bundleFile ? SIGNED_BUNDLE_MAX_BYTES : limits.maxBytes;
-    if (!Number.isSafeInteger(file.size) || file.size !== size || size > max) throw new SourceError('too-large');
     // Optional signature is read only from this same immutable revision, never from latest/raw URLs.
     let signature = null;
     const signatureFile = pinned.files[source.signatureFile];
     if (signatureFile && signatureFile.filename === source.signatureFile && signatureFile.truncated === false && typeof signatureFile.content === 'string' && (signatureFile.encoding === undefined || signatureFile.encoding === 'utf-8') && Number.isSafeInteger(signatureFile.size) && signatureFile.size === encoder.encode(signatureFile.content).length && signatureFile.size <= SIGNED_RELEASE_LIMITS.signatureBytes) signature = signatureFile.content;
     const result = await parseSourceText(file.content, release, limits, options, signal, signature);
-    return {...result, source: {type: 'gist', id: source.id, ownerId: source.ownerId, ownerLogin: source.ownerLogin, gistRevision, file: filename, url: `https://gist.github.com/${source.ownerLogin}/${source.id}/${gistRevision}`}};
+    return {...result, source: provenance};
   });
 }
 
-/** Only release-configured sources are accepted. Worker checks structure, never claims OpenPGP verification. */
+/** Only release-configured sources are accepted. requirePrimary disables fallback for deployment preflight.
+ * Worker checks structure, never claims OpenPGP verification. */
 export async function resolveKeys(release, fetchImpl = globalThis.fetch, internalOptions = {}) {
   if (!release || !Array.isArray(release.keys) || typeof release.allowEmpty !== 'boolean') throw new Error('Invalid deployed key release.');
   const keySource = validateKeySource(release.keySource);
   validateSignedReleaseConfig(release.signedRelease);
   if (internalOptions.requireSigned !== undefined && typeof internalOptions.requireSigned !== 'boolean') throw Error('requireSigned must be boolean.');
+  if (internalOptions.requirePrimary !== undefined && typeof internalOptions.requirePrimary !== 'boolean') throw Error('requirePrimary must be boolean.');
   const limits = {timeoutMs: boundedOption(internalOptions, 'timeoutMs'), maxBytes: boundedOption(internalOptions, 'maxBytes'), maxKeys: boundedOption(internalOptions, 'maxKeys')};
   const sources = validateFallbackSources(release.fallbackSources);
   const diagnostics = [];
@@ -315,12 +348,17 @@ export async function resolveKeys(release, fetchImpl = globalThis.fetch, interna
     }
     // An explicit unsigned empty primary cannot be replaced by signed fallback keys either.
     if (!release.signedDocument && !release.signedBundle && release.allowEmpty && !release.keys.length) throw new FallbackUnavailableError([{index: -1, code: 'unsigned-revocation'}]);
+    if (internalOptions.requirePrimary && !diagnostics.length) diagnostics.push({index: -1, code: internalOptions.requireSigned && release.keys.length ? 'invalid-signed-release' : 'unconfigured-primary'});
   } else {
     try {
       const result = await fetchGist(keySource, fetchImpl, limits, release, internalOptions);
-      return await snapshot(result.keys, release, result.source, result.signed);
-    } catch (error) { diagnostics.push(diagnostic(error, -1)); }
+      return await snapshot(result.keys, result.explicitEmpty ? {...release, allowEmpty: true} : release, result.source, result.signed);
+    } catch (error) {
+      diagnostics.push(diagnostic(error, -1));
+      if (error instanceof SourceError && ['unsigned-revocation', 'ambiguous-empty-primary'].includes(error.code)) throw new FallbackUnavailableError(diagnostics);
+    }
   }
+  if (internalOptions.requirePrimary) throw new FallbackUnavailableError(diagnostics);
   for (const [index, url] of sources.entries()) {
     try {
       const result = await fetchSource(url, fetchImpl, limits, release, internalOptions);
