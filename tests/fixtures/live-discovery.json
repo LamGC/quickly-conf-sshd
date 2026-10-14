@@ -1,0 +1,7 @@
+{
+  "testOnlyNotice": "Public integration-test identity only. Not production authorized keys or deployment trust. Do not change this fixture for a fork deployment.",
+  "email": "lam827@lamgc.net",
+  "primaryFingerprint": "7EF5FB1E65C1A6C6D02DFCDFCE57746D7E5EE6EF",
+  "signingSubkeyFingerprint": "B1B89449E5877614EA672F5F6C5AE2A913941E1D",
+  "keyservers": ["hkps://keys.openpgp.org", "hkps://keyserver.ubuntu.com"]
+}

@@ -1,0 +1,17 @@
+{
+  "baseUrl": "https://ssh.lamgc.me",
+  "repositoryUrl": "https://github.com/LamGC/quickly-conf-sshd",
+  "defaultCron": "*/15 * * * *",
+  "allowEmpty": false,
+  "fallbackSources": [],
+  "keySource": {
+    "type": "git"
+  },
+  "clientDefaults": {
+    "gpgVerification": "off",
+    "fingerprint": "",
+    "pinMode": "primary",
+    "listId": "",
+    "email": ""
+  }
+}

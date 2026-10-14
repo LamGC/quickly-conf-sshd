@@ -1,0 +1,8 @@
+node_modules/
+cf-worker/generated/
+cf-worker/public/
+.wrangler/
+*.log
+
+__pycache__/
+*.pyc
