@@ -382,16 +382,24 @@ lock_process_state() {
     # A live reused PID is deliberately treated as occupied. Never kill an
     # owner or infer staleness from its executable name/start-time mismatch.
     if kill -0 "$lock_pid" 2>/dev/null; then lock_process=live; return; fi
-    # kill -0 can fail for permissions. Require a working process query before
-    # declaring absence; unavailable/unsupported ps fails closed.
-    command -v ps >/dev/null 2>&1 || return 0
-    self_pid=$(ps -p "$$" -o pid= 2>/dev/null | tr -d ' ') || return 0
-    [ "$self_pid" = "$$" ] || return 0
-    process_status=0
-    process_pid=$(ps -p "$lock_pid" -o pid= 2>/dev/null) || process_status=$?
-    process_pid=$(printf '%s' "$process_pid" | tr -d ' ')
-    if [ "$process_status" = 0 ] && [ "$process_pid" = "$lock_pid" ]; then lock_process=live
-    elif [ "$process_status" = 1 ] && [ -z "$process_pid" ]; then lock_process=dead; fi
+    # kill -0 can fail for permissions. Require a successful all-process PID
+    # snapshot before declaring absence. GNU/BSD accept -A; BusyBox ps does not
+    # in every build, but its default selection includes all visible processes.
+    # Do not fall back to plain "ps -o pid": GNU's default selection is narrower.
+    if process_pids=$(ps -A -o pid 2>/dev/null); then :
+    elif command -v busybox >/dev/null 2>&1 && process_pids=$(busybox ps -o pid 2>/dev/null); then :
+    else return 0; fi
+    # Verify the complete output, including our own PID; failed, empty or
+    # malformed queries never turn an uncertain owner into a stale lock.
+    lock_process=$(printf '%s\n' "$process_pids" | awk -v own="$$" -v owner="$lock_pid" '
+        NR==1 {if(NF!=1 || $1!="PID") bad=1; next}
+        NF!=1 || $1 !~ /^[1-9][0-9]*$/ || length($1)>10 || $1+0>2147483647 {bad=1; next}
+        $1==own {self=1}
+        $1==owner {live=1}
+        END {if(bad || !self) print "unknown"; else if(live) print "live"; else print "dead"}
+    ')
+    # Recheck after the snapshot: a PID may have appeared while ps was running.
+    if [ "$lock_process" = dead ] && kill -0 "$lock_pid" 2>/dev/null; then lock_process=live; fi
 }
 acquire_lock() {
     lock_recovered=no
@@ -1600,7 +1608,7 @@ sync_keys() {
                      validate_response ); then accepted=yes; accepted_source=$source_url; break; fi
                 source_failure=validation
             fi
-            [ "$source_failure" = retrieval ] && [ "$source_attempt" -lt 5 ] || break
+            if [ "$source_failure" != retrieval ] || [ "$source_attempt" -ge 5 ]; then break; fi
             case $source_attempt in 1) retry_delay=1 ;; 2) retry_delay=3 ;; 3) retry_delay=8 ;; 4) retry_delay=12 ;; esac
             say "Retrieval attempt $source_attempt/5 failed for $source_url; retrying in ${retry_delay}s." >&2
             sleep "$retry_delay"

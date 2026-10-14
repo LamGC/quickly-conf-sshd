@@ -23,6 +23,10 @@ import errno
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / 'conf-sshd.sh').read_text()
 SHELL = shlex.split(os.environ.get('CONF_SSHD_TEST_SHELL', '/bin/sh'))
+# Keep the selected real shell independent of test-specific PATH mocks (notably
+# the busybox command mock used to exercise its process-list fallback).
+if SHELL and not os.path.isabs(SHELL[0]):
+    SHELL[0] = shutil.which(SHELL[0]) or SHELL[0]
 ORIGIN = 'https://keys.example.test'
 SCRIPT = SOURCE.replace('@@BASE_URL@@', ORIGIN).replace('@@DEFAULT_CRON@@', '*/15 * * * *').replace('@@DEFAULT_GPG_VERIFY@@', 'off').replace('@@DEFAULT_GPG_FINGERPRINT@@', '').replace('@@DEFAULT_GPG_PIN_MODE@@', 'primary').replace('@@DEFAULT_LIST_ID@@', '').replace('@@DEFAULT_GPG_EMAIL@@', '')
 KEY = (ROOT / 'tests/fixtures/keys.pub').read_bytes().strip() + b'\n'
@@ -636,9 +640,83 @@ fi
                 shutil.rmtree(lock)
         lock = self.make_lock()
         self.mock('ps', '#!/bin/sh\nexit 2\n')
+        self.mock('busybox', '#!/bin/sh\nexit 2\n')
         self.run_script('-o', ok=False)
         self.assertEqual((lock / 'pid').read_text(), '2147483647')
         self.assertEqual(self.calls.read_text(), '')
+
+    def mock_busybox_process_listing(self, listing=None, status=0):
+        # BusyBox standalone ash may resolve the ps applet before PATH and its
+        # ps lacks -p/-A. Simulate those options on every installed shell too.
+        self.mock('ps', '''#!/bin/sh
+printf 'ps %s\\n' "$*" >> "$TEST_CALLS"
+exit 1
+''')
+        body = 'exec /bin/ps -A -o pid' if listing is None else (
+            'printf \'%s\\n\' ' + shlex.quote(listing) + '\nexit ' + str(status))
+        self.mock('busybox', '''#!/bin/sh
+printf 'busybox %s\\n' "$*" >> "$TEST_CALLS"
+[ "$*" = 'ps -o pid' ] || exit 2
+''' + body + '\n')
+
+    def test_full_process_selection_succeeds_without_busybox_fallback(self):
+        self.make_lock()
+        self.mock('ps', '''#!/bin/sh
+printf 'ps %s\\n' "$*" >> "$TEST_CALLS"
+[ "$*" = '-A -o pid' ] || exit 2
+exec /bin/ps "$@"
+''')
+        self.mock('busybox', '#!/bin/sh\necho UNEXPECTED busybox fallback >> "$TEST_CALLS"\nexit 2\n')
+        self.run_script('-o')
+        self.assertIn('ps -A -o pid\n', self.calls.read_text())
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assert_clean()
+
+    def test_nonzero_or_corrupt_full_snapshot_still_fails_closed(self):
+        for mutation in ('exit 1', "printf 'not-a-pid\\n'", "printf '1 extra-column\\n'"):
+            with self.subTest(mutation=mutation):
+                lock = self.make_lock()
+                self.mock('ps', '#!/bin/sh\n/bin/ps -A -o pid\n' + mutation + '\n')
+                self.mock('busybox', '#!/bin/sh\nexit 2\n')
+                result = self.run_script('-o', ok=False)
+                self.assertIn('Cannot prove', result.stderr)
+                self.assertEqual((lock / 'pid').read_text(), '2147483647')
+                self.assertFalse((lock / 'reclaim').exists())
+                shutil.rmtree(lock)
+        self.assertEqual(self.fetch_calls(), [])
+
+    def test_busybox_ps_without_selection_flags_recovers_stale_lock(self):
+        self.make_lock()
+        self.mock_busybox_process_listing()
+        self.run_script('-o')
+        self.assertIn('ps -A -o pid\n', self.calls.read_text())
+        self.assertIn('busybox ps -o pid\n', self.calls.read_text())
+        self.assertEqual(len(self.fetch_calls()), 1)
+        self.assert_clean()
+
+    def test_process_snapshot_keeps_live_pid_when_kill_probe_is_denied(self):
+        lock = self.make_lock(str(os.getpid()))
+        self.mock('kill', '#!/bin/sh\nexit 1\n')
+        self.mock_busybox_process_listing()
+        result = self.run_script('-o')
+        self.assertIn('skipping', result.stdout)
+        self.assertEqual((lock / 'pid').read_text(), str(os.getpid()))
+        self.assertEqual(self.fetch_calls(), [])
+        self.assertFalse((lock / 'reclaim').exists())
+
+    def test_failed_empty_or_malformed_process_snapshots_never_reap(self):
+        for listing, status in [('', 0), ('PID\n', 0), ('PID\n1\n', 0),
+                                ('PID\nnot-a-pid\n', 0), ('PID\n2147483648\n', 0),
+                                ('PID\n1 extra-column\n', 0), ('PID\n1\n', 1)]:
+            with self.subTest(listing=listing, status=status):
+                lock = self.make_lock()
+                self.mock_busybox_process_listing(listing, status)
+                result = self.run_script('-o', ok=False)
+                self.assertIn('Cannot prove', result.stderr)
+                self.assertEqual((lock / 'pid').read_text(), '2147483647')
+                self.assertFalse((lock / 'reclaim').exists())
+                self.assertEqual(self.fetch_calls(), [])
+                shutil.rmtree(lock)
 
     def test_malicious_lock_paths_are_rejected_without_touching_targets(self):
         outside = self.root / 'outside-lock'
